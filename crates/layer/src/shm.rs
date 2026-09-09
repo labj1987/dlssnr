@@ -67,6 +67,20 @@ impl ShmClient {
         (!self.header.is_null()).then(|| unsafe { &*self.header })
     }
 
+    /// Whether it's worth paying for a real capture this frame at all. `false` once
+    /// the helper has reported the model permanently unavailable (see
+    /// `dlssnr_helper::ngx::ensure_feature`'s own one-shot-then-disable design) --
+    /// capturing and writing back a frame nobody will ever evaluate is pure overhead
+    /// (a full image<->buffer round trip plus a `memcpy` of the whole frame, every
+    /// single present call) for zero chance of a different outcome. Reads a single
+    /// already-mapped atomic; never blocks and never opens the mapping itself, so it's
+    /// always safe to check before deciding whether to call
+    /// [`crate::capture::run`] at all.
+    pub fn model_known_unavailable(&self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        hdr.helper_state.load(Ordering::Relaxed) == helper_state::MODEL_FAILED
+    }
+
     /// Records what the proxy bytes about to be written actually are -- the helper
     /// (and, on the way back, this same layer reading the answer) needs `width`/
     /// `height`/`proxy_format` to know how many of the region's bytes are real for

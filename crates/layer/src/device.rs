@@ -326,6 +326,16 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let State { shm, capture, .. } = &mut *state;
+                if shm.model_known_unavailable() {
+                    // The helper has permanently disabled itself for this session
+                    // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
+                    // ever evaluate a captured frame, so paying for the capture
+                    // itself (a full image<->buffer round trip plus a whole-frame
+                    // `memcpy`, every single present call) is pure waste. Skip
+                    // straight to a real no-op present, matching what "fail-open"
+                    // should actually cost: nothing.
+                    break;
+                }
                 if let Some(instance) = &self.instance {
                     // SAFETY: `queue` is the same queue this present call was made on,
                     // externally synchronized for its duration by the same Vulkan rule

@@ -88,9 +88,15 @@ fn main() {
             answer_buf.resize(bytes, 0);
             let n = shm.read_proxy(&mut proxy_buf);
 
-            let ready = ngx::ensure_feature(&mut snippet, width, height);
+            let ready = ngx::ensure_feature(&mut snippet, &device, queue, width, height);
             if ready {
                 hdr.model_up.store(1, Ordering::Relaxed);
+            } else if snippet.disabled {
+                // `ensure_feature` only ever disables the snippet after a real,
+                // one-shot `CreateFeature` attempt (see its own doc comment) -- worth
+                // surfacing in status immediately rather than leaving `RUNNING`
+                // displayed forever after the model is permanently unavailable.
+                hdr.helper_state.store(dlssnr_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
             }
             let evaluated = ready
                 && proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8
@@ -149,6 +155,29 @@ fn main() {
 /// `VkInstance`/`VkPhysicalDevice`/`VkDevice`, plus the one queue (family 0, index 0 --
 /// every device has at least one family, and this is the same family `ngx`'s device
 /// was created against) real per-frame work submits against.
+/// Extensions a real, working reference implementation's own compiled helper
+/// references (confirmed via `strings` on its binary, never its source -- run side
+/// by side with ours this session, which is how the actual gap this closes was
+/// found: our device previously enabled *none* of these). Requested only when
+/// actually present in `vkEnumerateDeviceExtensionProperties` -- never assumed.
+/// `VK_NVX_binary_import`/`VK_NVX_image_view_handle`/`VK_KHR_buffer_device_address`
+/// in particular are the kind of NVIDIA-internal plumbing NGX's own shader/resource
+/// management is plausibly built on; calling into it from a device that never
+/// enabled them is the leading suspect for why `CreateFeature` behaved inconsistently
+/// (a clean reject one run, an actual C++ exception the next) even after every
+/// parameter this session could confirm from the same binary was added.
+const WANTED_DEVICE_EXTENSIONS: &[&str] = &[
+    "VK_EXT_debug_utils",
+    "VK_EXT_external_memory_dma_buf",
+    "VK_EXT_external_memory_host",
+    "VK_KHR_buffer_device_address",
+    "VK_KHR_external_memory_fd",
+    "VK_KHR_push_descriptor",
+    "VK_NV_optical_flow",
+    "VK_NVX_binary_import",
+    "VK_NVX_image_view_handle",
+];
+
 fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue)> {
     // SAFETY: dynamically loads `vulkan-1.dll` via the `loaded` feature; the usual
     // caveats of loading an arbitrary shared library apply and are accepted here the
@@ -168,10 +197,34 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
         props.vendor_id == 0x10DE // NVIDIA -- the model only ever runs on its own hardware.
     }).or(physical_devices.first())?;
 
+    // SAFETY: `physical_device` is one of the handles just enumerated above.
+    let available = unsafe { instance.enumerate_device_extension_properties(physical_device) }.unwrap_or_default();
+    let available_names: std::collections::HashSet<String> = available
+        .iter()
+        .filter_map(|e| {
+            // SAFETY: `extension_name` is a NUL-terminated C string the driver itself
+            // populated; reading it as a CStr is exactly what every other `ash`
+            // consumer does with this same field.
+            unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) }.to_str().ok().map(str::to_owned)
+        })
+        .collect();
+    let enabled: Vec<&str> = WANTED_DEVICE_EXTENSIONS.iter().copied().filter(|e| available_names.contains(*e)).collect();
+    dlssnr_helper::log!(
+        "[helper] device extensions: {}/{} of the wanted set available: {:?}",
+        enabled.len(),
+        WANTED_DEVICE_EXTENSIONS.len(),
+        enabled
+    );
+    let enabled_c: Vec<std::ffi::CString> = enabled.iter().map(|e| std::ffi::CString::new(*e).unwrap()).collect();
+    let enabled_ptrs: Vec<*const std::ffi::c_char> = enabled_c.iter().map(|c| c.as_ptr()).collect();
+
     let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
-    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    let device_create_info =
+        vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&enabled_ptrs);
     // SAFETY: `device_create_info` is valid; queue family 0 exists on every physical
-    // device (the Vulkan spec guarantees at least one queue family).
+    // device (the Vulkan spec guarantees at least one queue family); `enabled_ptrs`
+    // point at only extensions just confirmed present in `available_names`, and
+    // `enabled_c` (which owns the bytes they point into) outlives this call.
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     // SAFETY: `device` was just created with exactly one queue on family 0, index 0.
     let queue = unsafe { device.get_device_queue(0, 0) };

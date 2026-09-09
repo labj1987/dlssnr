@@ -222,6 +222,36 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     }
     s.params = params;
 
+    // Round-trip self-test: set a scratch value through the parameter vtable, then
+    // read it straight back, before this parameter block is used for anything real.
+    // Observed as a real step in a working reference implementation's own log output
+    // (run side by side on this machine, never its source -- see this session's
+    // investigation) right after its own successful AllocateParameters; this crate
+    // never did anything like it. Purely diagnostic for now: logs whether the
+    // written/read values match, doesn't gate anything on the result yet.
+    {
+        let probe_name = CString::new("DLSSNR.SelfTestProbe").unwrap();
+        let (test_result, seh) = guarded(
+            || {
+                // SAFETY: `params` was just validated above as a live, non-null
+                // parameter block from a successful `AllocateParameters`.
+                unsafe {
+                    abi::ngx_set_u32(params, probe_name.as_ptr(), 0x5a5a);
+                    let mut readback: u32 = 0;
+                    let r = abi::ngx_get_u32(params, probe_name.as_ptr(), &mut readback);
+                    (r, readback)
+                }
+            },
+            (abi::result::FAIL_SEH, 0),
+        );
+        crate::log!(
+            "[ngx] params round-trip self-test -> {:#x} seh={:#x} readback={:#x}",
+            test_result.0 as u32,
+            seh,
+            test_result.1
+        );
+    }
+
     let Some(init_ext) = s.init_ext else {
         crate::log!("[ngx] snippet has no VULKAN_Init_Ext export");
         s.disabled = true;
@@ -254,6 +284,61 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         return s;
     }
 
+    // Experimental: `NVSDK_NGX_VULKAN_GetFeatureRequirements` is a real export in the
+    // DLL (confirmed via `objdump -p`) that nothing here has ever called. Real NGX
+    // integrations call this before `CreateFeature`; skipping it is the leading
+    // hypothesis for why `CreateFeature(18)` at a real size hangs indefinitely inside
+    // the driver (`libnvidia-glcore.so`, confirmed via gdb) rather than returning or
+    // faulting -- plausibly because some internal driver state this call would set up
+    // never gets set up. `abi::FnVkGetFeatureRequirements`'s signature is a guess (no
+    // `FeatureDiscoveryInfo`-shaped input, unlike NVIDIA's real public NGX SDK) since
+    // this is a fictional feature with no spec to check the guess against -- guarded
+    // the same as everything else here, purely to observe what it reports/does
+    // without gating anything on the result yet.
+    if let Some(get_requirements) =
+        unsafe { resolve_export::<abi::FnVkGetFeatureRequirements>(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements") }
+    {
+        let ((req_result, reqs), seh) = guarded(
+            || {
+                let mut reqs = abi::NgxFeatureRequirements {
+                    version: abi::NgxSdkVersion { major: 0, minor: 0 },
+                    feature_flags: 0,
+                    min_gpu_mode: 0,
+                    in_gpu_mode: 0,
+                    min_cs_major_version: 0,
+                    min_cs_minor_version: 0,
+                };
+                // SAFETY: `get_requirements` resolved above from the live snippet
+                // module; `instance`/`physical_device` are the caller's own, live
+                // handles; `&mut reqs` is a valid out-pointer for the call's duration.
+                let r = unsafe { get_requirements(instance, physical_device, &mut reqs) };
+                (r, reqs)
+            },
+            (abi::result::FAIL_SEH, abi::NgxFeatureRequirements {
+                version: abi::NgxSdkVersion { major: 0, minor: 0 },
+                feature_flags: 0,
+                min_gpu_mode: 0,
+                in_gpu_mode: 0,
+                min_cs_major_version: 0,
+                min_cs_minor_version: 0,
+            }),
+        );
+        crate::log!(
+            "[ngx] GetFeatureRequirements -> {:#x} seh={:#x} version={}.{} flags={:#x} min_gpu_mode={} in_gpu_mode={} min_cs={}.{}",
+            req_result as u32,
+            seh,
+            reqs.version.major,
+            reqs.version.minor,
+            reqs.feature_flags,
+            reqs.min_gpu_mode,
+            reqs.in_gpu_mode,
+            reqs.min_cs_major_version,
+            reqs.min_cs_minor_version
+        );
+    } else {
+        crate::log!("[ngx] snippet has no VULKAN_GetFeatureRequirements export");
+    }
+
     // Feature creation is deferred to `ensure_feature`, called once the per-frame
     // loop (`main.rs`) knows a real width/height -- there is no real frame to build it
     // at the size of yet at this point in startup.
@@ -281,7 +366,7 @@ impl NgxSnippet {
 /// design this would eventually hook into); most games never resize their swapchain
 /// mid-session, and a size change today is simply not picked up until the helper
 /// restarts.
-pub fn ensure_feature(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
+pub fn ensure_feature(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32) -> bool {
     if s.disabled {
         return false;
     }
@@ -291,10 +376,22 @@ pub fn ensure_feature(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
-    create_feature_at(s, width, height)
+    let ok = create_feature_at(s, device, queue, width, height);
+    if !ok {
+        // One attempt only: a failed `CreateFeature` here means either a real fault
+        // or a clean rejection from the DLL (see `main.rs`'s own doc comment on the
+        // caller-identity-gate result this currently returns) -- neither is the kind
+        // of transient condition retrying next frame would fix, and retrying anyway
+        // meant re-doing the full command pool/buffer/fence setup on every single
+        // captured frame forever, adding real per-frame Vulkan object churn for no
+        // chance of a different outcome (found while investigating the real-size
+        // CreateFeature hang this session already fixed separately).
+        s.disabled = true;
+    }
+    ok
 }
 
-fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
+fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32) -> bool {
     let Some(create_feature) = s.create_feature else { return false };
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
@@ -318,6 +415,42 @@ fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
                 abi::ngx_set_u32(params, name("DLSSNR.Upscaling").as_ptr(), 0);
                 abi::ngx_set_f32(params, name("DLSSNR.Scale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("DLSSNR.ScalingRatio").as_ptr(), 1.0);
+                // 0 = a conservative, always-valid choice among the real SDK's
+                // `NVSDK_NGX_PerfQuality_Value_*` enumerants (0=MaxPerf, 1=Balanced,
+                // 2=MaxQuality, ...) -- upstream sets this and this crate previously
+                // didn't set it at all.
+                abi::ngx_set_u32(params, name("DLSSNR.Hint.Render.Preset").as_ptr(), 0);
+                abi::ngx_set_u32(params, name("NVSDK_NGX_Parameter_PerfQualityValue").as_ptr(), 0);
+                // The rest of this block: real parameter names confirmed present in
+                // the DLL's own accepted-parameter string table (`objdump`/`strings`
+                // on the actual DLL and on a real, working reference implementation's
+                // own compiled helper this session installed and ran side by side --
+                // never its source, per the project's own "shape not expression"
+                // rule), not previously set here at all. `DLSSNR.Output.Width`/
+                // `.Height` (dotted) do NOT exist in the real string table -- an
+                // earlier version of this fix added them based on a mismatched
+                // third-party reference and has been removed.
+                abi::ngx_set_u32(params, name("DLSSNR.Enabled").as_ptr(), 1);
+                abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), 1);
+                abi::ngx_set_u32(params, name("DLSSNR.Style").as_ptr(), 0);
+                abi::ngx_set_f32(params, name("DLSSNR.Intensity").as_ptr(), 1.0);
+                abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), 1.0);
+                abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), 1.0);
+                // -1 follows local structure; it is not a strength of zero -- same
+                // convention `dlssnr_protocol::PassControl::reset_to_defaults`
+                // already documents for this exact field.
+                abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), -1.0);
+                abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), 1);
+                abi::ngx_set_u32(params, name("DLSSNR.AutoExposure").as_ptr(), 1);
+                abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
+                abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
+                // This helper always captures the swapchain as a plain 8-bit UNORM
+                // proxy today (see `dlssnr_layer::capture`) regardless of the
+                // swapchain's own HDR-ness -- SDR is the only honest hint to give
+                // until the real HDR float16 path (mentioned in the project's own
+                // README, not yet implemented) exists.
+                abi::ngx_set_u32(params, name("DLSSNR.Hdr").as_ptr(), 0);
+                abi::ngx_set_u32(params, name("DLSSNR.SDR").as_ptr(), 1);
                 abi::ngx_set_u32(params, name("Width").as_ptr(), width);
                 abi::ngx_set_u32(params, name("Height").as_ptr(), height);
                 abi::ngx_set_u32(params, name("CreationNodeMask").as_ptr(), 1);
@@ -333,14 +466,51 @@ fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
         return false;
     }
 
+    // `NVSDK_NGX_VULKAN_CreateFeature`'s first parameter is a real, currently-
+    // recording `VkCommandBuffer` -- the DLL records GPU-side setup work into it, and
+    // the caller is responsible for ending/submitting/fence-waiting it afterward
+    // (confirmed against the real, non-fictional NGX API shape: `abi::FnVkCreateFeature`
+    // already declares this parameter; comparing against the actual upstream project's
+    // own documented call sequence -- see this session's investigation -- shows it
+    // passing a real command list here, then closing + executing + fence-waiting it,
+    // never a null one). Passing `vk::CommandBuffer::null()` here previously was wrong:
+    // the DLL then has nothing valid to record the setup work into and never gets
+    // anything to wait on, which is consistent with the indefinite hang inside the
+    // driver this was fixed after observing (see `guard.rs`/CLAUDE.md history).
+    let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(0);
+    // SAFETY: `device` is the live device this snippet was initialized against.
+    let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else {
+        crate::log!("[ngx] CreateFeature: failed to create the setup command pool");
+        return false;
+    };
+    let alloc_info =
+        vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+    // SAFETY: `pool` was just created above.
+    let cmd = match unsafe { device.allocate_command_buffers(&alloc_info) } {
+        Ok(bufs) => bufs[0],
+        Err(_) => {
+            crate::log!("[ngx] CreateFeature: failed to allocate the setup command buffer");
+            // SAFETY: `pool` owns no other resources yet.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return false;
+        }
+    };
+    let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: `cmd` was just allocated above, never previously recorded into.
+    if unsafe { device.begin_command_buffer(cmd, &begin_info) }.is_err() {
+        crate::log!("[ngx] CreateFeature: failed to begin the setup command buffer");
+        // SAFETY: `pool` owns `cmd`; nothing else references either.
+        unsafe { device.destroy_command_pool(pool, None) };
+        return false;
+    }
+
     let ((result, handle), seh) = guarded(
         || {
             let mut handle: abi::NgxHandle = std::ptr::null_mut();
             // SAFETY: `create_feature` resolved and validated in `load_and_init`;
-            // `vk::CommandBuffer::null()` matches upstream's own create-time contract
-            // (create happens outside a recording command buffer in this milestone --
-            // no frame exists yet to record into); `params`/`&mut handle` are valid.
-            let r = unsafe { create_feature(vk::CommandBuffer::null(), abi::FEATURE_DLSSNR, params, &mut handle) };
+            // `cmd` is a valid, currently-recording command buffer (begun just
+            // above); `params`/`&mut handle` are valid.
+            let r = unsafe { create_feature(cmd, abi::FEATURE_DLSSNR, params, &mut handle) };
             (r, handle)
         },
         (abi::result::FAIL_SEH, std::ptr::null_mut()),
@@ -351,6 +521,43 @@ fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
         seh,
         handle
     );
+
+    if seh != 0 {
+        // A fault during recording leaves `cmd`'s contents unknown/possibly
+        // corrupted -- abandon it rather than risk submitting garbage GPU work.
+        // SAFETY: `cmd` was never submitted; `pool` owns it and nothing else.
+        unsafe { device.destroy_command_pool(pool, None) };
+        return false;
+    }
+    // SAFETY: `cmd` was successfully recorded into above (the guarded call above
+    // returned without faulting, regardless of `result`'s own success/failure code --
+    // the DLL may still have recorded partial setup work that needs a matching
+    // end/submit either way, matching upstream's own "always close+execute" sequence).
+    if unsafe { device.end_command_buffer(cmd) }.is_err() {
+        crate::log!("[ngx] CreateFeature: failed to end the setup command buffer");
+        unsafe { device.destroy_command_pool(pool, None) };
+        return false;
+    }
+    let fence_info = vk::FenceCreateInfo::builder();
+    // SAFETY: `fence_info` is valid.
+    let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else {
+        crate::log!("[ngx] CreateFeature: failed to create the setup fence");
+        unsafe { device.destroy_command_pool(pool, None) };
+        return false;
+    };
+    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
+    // SAFETY: `cmd` was just ended above; `queue` is the caller's own, live queue.
+    let submitted = unsafe { device.queue_submit(queue, &[submit], fence) }.is_ok();
+    let waited = submitted && unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.is_ok();
+    crate::log!("[ngx] CreateFeature: setup command buffer submitted={submitted} waited={waited}");
+    // SAFETY: either the fence was just waited on (work complete), or submission
+    // itself failed (nothing in flight to wait for) -- both cases make destroying
+    // these handles now sound.
+    unsafe {
+        device.destroy_fence(fence, None);
+        device.destroy_command_pool(pool, None);
+    }
+
     if !abi::succeeded(result) || handle.is_null() {
         return false;
     }
