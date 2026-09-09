@@ -344,6 +344,21 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   command line (`proton run <helper.exe>` with the right env vars) has not been run
   for real.
 
+## Docs and release (done)
+
+`README.md`/`ATTRIBUTION.md`/`LICENSE` written fresh — not copied from upstream's own
+README/ATTRIBUTION.md, which were read (cloned to `/tmp/dlss5vklayer-review` in an
+earlier session) only to know what to credit, per the same "shape not expression" rule
+as the code. `ATTRIBUTION.md` explicitly separates what's really taken (DLSS5VKLayer's
+architecture/protocol shape, RenoDX's MIT-licensed composition design, Ottosson's OkLab
+constants) from what's deliberately not taken (the GPL-3.0 OptiScaler/DLSS-NR shader
+code upstream's own `ATTRIBUTION.md` admits it carries) and from the one place this
+project *does* knowingly reproduce upstream's approach on purpose (the NGX
+caller-identity spoof) — that section says so plainly rather than blending it in.
+`v0.1.0` tagged and pushed as a GitHub release with the AppImage + `.zsync` sidecar as
+assets — repo and release are both public, matching GreenLight/SteamPunk's convention
+(confirmed via `gh repo view` before creating it).
+
 ## Build process (milestone 6, real and verified end-to-end — this actually produced
 ## a working AppImage in this session)
 
