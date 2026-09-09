@@ -146,6 +146,8 @@ pub fn build_ui(app: &adw::Application) {
     page.add(&build_status_group(&shm, &toasts));
 
     let header = adw::HeaderBar::new();
+    let about_btn = gtk4::Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
+    header.pack_end(&about_btn);
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&page);
@@ -158,6 +160,21 @@ pub fn build_ui(app: &adw::Application) {
         .default_height(760)
         .content(&toasts)
         .build();
+
+    {
+        let window = window.clone();
+        about_btn.connect_clicked(move |_| {
+            let dialog = adw::AboutDialog::builder()
+                .application_name("dlssnr")
+                .version(env!("CARGO_PKG_VERSION"))
+                .developers(vec!["Linnard Alex Brown Jr."])
+                .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
+                .build();
+            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)"]);
+            dialog.present(Some(&window));
+        });
+    }
+
     window.present();
 }
 
