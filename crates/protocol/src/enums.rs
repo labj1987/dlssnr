@@ -119,6 +119,21 @@ pub mod proxy_format {
     pub const UNKNOWN: u32 = 0;
     pub const RGBA8: u32 = 1;
     pub const RGBA16F: u32 = 2;
+
+    /// Bytes per pixel for a raw dump in this format -- shared by the layer (which
+    /// writes the proxy region at this size) and the helper (which needs to know how
+    /// many of the region's bytes are real for a given frame, not the full
+    /// `MAX_FRAME`-sized reservation). Unknown formats are treated as the smaller,
+    /// 8-bit encoding: a format this crate doesn't recognize should never have been
+    /// written in the first place, and under-reading is safer than over-reading past
+    /// what was actually captured.
+    pub fn bytes_per_pixel(format: u32) -> usize {
+        if format == RGBA16F {
+            8
+        } else {
+            4
+        }
+    }
 }
 
 pub mod mvec_scale_mode {

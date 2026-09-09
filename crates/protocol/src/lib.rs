@@ -68,3 +68,16 @@ pub const NAME_BYTES: usize = 128;
 pub const fn shm_total_bytes() -> usize {
     HEADER_BYTES + MAX_FRAME * 2
 }
+
+/// Byte offset of the proxy region (the frame the layer hands the model) within the
+/// mapping. Both sides derive this the same way rather than hardcoding `HEADER_BYTES`
+/// separately, so a future header resize can't silently desync them.
+pub const fn proxy_offset() -> usize {
+    HEADER_BYTES
+}
+
+/// Byte offset of the answer region (the model's raw output, for the composition pass)
+/// within the mapping.
+pub const fn answer_offset() -> usize {
+    HEADER_BYTES + MAX_FRAME
+}

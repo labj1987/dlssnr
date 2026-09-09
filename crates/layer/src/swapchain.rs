@@ -13,6 +13,23 @@ pub struct SwapchainState {
     /// larger than the protocol's ceiling (`dlssnr_protocol::{MAX_W,MAX_H}`) -- it
     /// presents untouched either way.
     pub pass_through: bool,
+    /// The swapchain's own images, in `vkGetSwapchainImagesKHR` order -- index `i`
+    /// here is exactly what `VkPresentInfoKHR::pImageIndices[i]` refers to. Fetched
+    /// once at creation (see `device::DlssnrDeviceInfo::fetch_swapchain_images`).
+    pub images: Vec<vk::Image>,
+}
+
+/// A blunt filter against known-small compositor/overlay swapchains (the Steam
+/// overlay's own render target showed up at 1262x598 in testing) that would otherwise
+/// each separately decide they're "primary" -- `device::PRIMARY`'s claim is per
+/// *process*, and the overlay runs as its own separate process with its own copy of
+/// every static in this crate, so it can't see that the game already claimed primary
+/// in a different address space. Not a real fix for multi-process arbitration (there
+/// isn't one yet -- see the milestone-4 plan's known-gaps note); just enough to stop
+/// the overlay's own tiny swapchain from fighting the game's real one over the same
+/// shared-memory transport.
+pub fn is_plausible_game_size(width: u32, height: u32) -> bool {
+    u64::from(width) * u64::from(height) >= 1280 * 720
 }
 
 /// Whether this is a format the composition pass can work in. Every one has an 8-bit
@@ -34,6 +51,18 @@ pub fn is_supported_format(format: vk::Format) -> bool {
             | vk::Format::A2R10G10B10_UNORM_PACK32
             | vk::Format::R16G16B16A16_SFLOAT
     )
+}
+
+/// The `dlssnr_protocol::enums::proxy_format` this swapchain's raw
+/// `vkCmdCopyImageToBuffer` dump actually is -- only meaningful for formats
+/// [`is_supported_format`] already accepted. `proxy_format::bytes_per_pixel` is the
+/// single source of truth for the byte count that goes with this; nothing here
+/// duplicates it.
+pub fn proxy_format_for(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::R16G16B16A16_SFLOAT => dlssnr_protocol::enums::proxy_format::RGBA16F,
+        _ => dlssnr_protocol::enums::proxy_format::RGBA8,
+    }
 }
 
 /// What a swapchain's format and colour space together say about the light in the

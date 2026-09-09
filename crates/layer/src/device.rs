@@ -1,17 +1,7 @@
 //! Per-device state and the [`DeviceHooks`] implementation: `vkCreateSwapchainKHR`/
-//! `vkDestroySwapchainKHR` track swapchains, `vkQueuePresentKHR` is where the
-//! shared-memory round trip happens.
-//!
-//! Milestone 2 scope (see `/home/alex/.claude/plans/breezy-napping-waffle.md`): the
-//! round trip runs for real (exercising `crate::shm::ShmClient`'s state machine against
-//! a real or stub helper), but nothing here touches swapchain image contents yet --
-//! `queue_present_khr` always calls through with the original, unmodified present info.
-//! Actually capturing/composing frames needs its own GPU resources (command pool,
-//! fences, staging/imported buffers) that milestone 4 (the composition pass) adds here;
-//! `get_device_queue`/`get_device_queue2` (remembering which queue family to build that
-//! command pool on) and the device-extension injection for the dma-buf transport are
-//! deferred to that same milestone, since neither means anything before there's a real
-//! GPU pass to serve.
+//! `vkDestroySwapchainKHR` track swapchains, `vkGetDeviceQueue`/`vkGetDeviceQueue2`
+//! learn which queue family a queue belongs to, `vkQueuePresentKHR` is where the real
+//! capture/transport/write-back round trip (`crate::capture::run`) happens now.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -20,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use vulkan_layer::{DeviceHooks, DeviceInfo, LayerResult, LayerVulkanCommand as VulkanCommand};
 
+use crate::capture;
 use crate::shm::ShmClient;
 use crate::swapchain::{self, SwapchainState};
 
@@ -81,11 +72,19 @@ unsafe fn resolve<F: Copy>(get_proc: vk::PFN_vkGetDeviceProcAddr, device: vk::De
 }
 
 pub struct DlssnrDeviceInfo {
-    #[allow(dead_code)] // kept alive so `next_*` fn pointers stay valid; not yet called through directly
     device: Arc<ash::Device>,
+    /// `None` only in the hypothetical case `create_device_info`'s own doc comment
+    /// notes (a device created against an instance from before this layer loaded,
+    /// which never happens for an implicit layer) -- capture is simply skipped
+    /// (present passes through unmodified) whenever it is, rather than panicking.
+    instance: Option<Arc<ash::Instance>>,
+    physical_device: vk::PhysicalDevice,
     next_create_swapchain_khr: Option<vk::PFN_vkCreateSwapchainKHR>,
     next_destroy_swapchain_khr: Option<vk::PFN_vkDestroySwapchainKHR>,
     next_queue_present_khr: Option<vk::PFN_vkQueuePresentKHR>,
+    next_get_swapchain_images_khr: Option<vk::PFN_vkGetSwapchainImagesKHR>,
+    next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
+    next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
     state: Mutex<State>,
 }
 
@@ -93,10 +92,18 @@ pub struct DlssnrDeviceInfo {
 struct State {
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
     shm: ShmClient,
+    /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
+    /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
+    /// since Vulkan has no query that answers this for a handle after the fact. Needed
+    /// to build a command pool for whatever queue `queue_present_khr` hands us.
+    queue_families: HashMap<vk::Queue, u32>,
+    capture: Option<capture::CaptureResources>,
 }
 
 impl DlssnrDeviceInfo {
     pub fn new(
+        instance: Option<Arc<ash::Instance>>,
+        physical_device: vk::PhysicalDevice,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     ) -> Self {
@@ -104,11 +111,7 @@ impl DlssnrDeviceInfo {
         // SAFETY: `next_get_device_proc_addr` is the next layer/driver's own
         // `vkGetDeviceProcAddr`, handed to us by the layer framework for exactly this
         // device; each name below matches the `PFN_vk*` type requested.
-        //
-        // `vkGetSwapchainImagesKHR` isn't resolved here (yet): nothing reads the image
-        // list until milestone 4 needs to know which swapchain image `vkQueuePresentKHR`
-        // is about to present, to capture from it.
-        let (create, destroy, present) = unsafe {
+        let (create, destroy, present, get_images, get_queue, get_queue2) = unsafe {
             (
                 resolve::<vk::PFN_vkCreateSwapchainKHR>(
                     next_get_device_proc_addr,
@@ -125,6 +128,13 @@ impl DlssnrDeviceInfo {
                     handle,
                     c"vkQueuePresentKHR",
                 ),
+                resolve::<vk::PFN_vkGetSwapchainImagesKHR>(
+                    next_get_device_proc_addr,
+                    handle,
+                    c"vkGetSwapchainImagesKHR",
+                ),
+                resolve::<vk::PFN_vkGetDeviceQueue>(next_get_device_proc_addr, handle, c"vkGetDeviceQueue"),
+                resolve::<vk::PFN_vkGetDeviceQueue2>(next_get_device_proc_addr, handle, c"vkGetDeviceQueue2"),
             )
         };
         crate::log!(
@@ -134,11 +144,38 @@ impl DlssnrDeviceInfo {
         );
         Self {
             device,
+            instance,
+            physical_device,
             next_create_swapchain_khr: create,
             next_destroy_swapchain_khr: destroy,
             next_queue_present_khr: present,
+            next_get_swapchain_images_khr: get_images,
+            next_get_device_queue: get_queue,
+            next_get_device_queue2: get_queue2,
             state: Mutex::default(),
         }
+    }
+
+    /// The images backing `swapchain`, in the order the loader hands out indices for
+    /// `VkPresentInfoKHR::pImageIndices` -- cached once at creation (see
+    /// `create_swapchain_khr`) since the list never changes for a swapchain's lifetime.
+    fn fetch_swapchain_images(&self, swapchain: vk::SwapchainKHR) -> Vec<vk::Image> {
+        let Some(get_images) = self.next_get_swapchain_images_khr else { return Vec::new() };
+        let handle = self.device.handle();
+        let mut count = 0u32;
+        // SAFETY: `get_images` was resolved from the next layer/driver's own proc-addr
+        // table; the two-call enumeration pattern (count, then fill) is exactly what
+        // the Vulkan spec requires for this function.
+        if unsafe { get_images(handle, swapchain, &mut count, std::ptr::null_mut()) } != vk::Result::SUCCESS {
+            return Vec::new();
+        }
+        let mut images = vec![vk::Image::null(); count as usize];
+        // SAFETY: `images` has exactly `count` elements, matching what the first call
+        // just reported.
+        if unsafe { get_images(handle, swapchain, &mut count, images.as_mut_ptr()) } != vk::Result::SUCCESS {
+            return Vec::new();
+        }
+        images
     }
 }
 
@@ -151,6 +188,8 @@ impl DeviceInfo for DlssnrDeviceInfo {
             VulkanCommand::CreateSwapchainKhr,
             VulkanCommand::DestroySwapchainKhr,
             VulkanCommand::QueuePresentKhr,
+            VulkanCommand::GetDeviceQueue,
+            VulkanCommand::GetDeviceQueue2,
         ]
     }
 
@@ -185,25 +224,51 @@ impl DeviceHooks for DlssnrDeviceInfo {
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
         let pass_through = !swapchain::is_supported_format(create_info.image_format)
             || create_info.image_extent.width > dlssnr_protocol::MAX_W
-            || create_info.image_extent.height > dlssnr_protocol::MAX_H;
+            || create_info.image_extent.height > dlssnr_protocol::MAX_H
+            || !swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
+        let images = if pass_through { Vec::new() } else { self.fetch_swapchain_images(swapchain) };
         let state = SwapchainState {
             format: create_info.image_format,
             width: create_info.image_extent.width,
             height: create_info.image_extent.height,
             hdr_kind,
             pass_through,
+            images,
         };
         crate::log!(
-            "[layer] swapchain {:?} {}x{} fmt={:?} hdr={} pass_through={}",
+            "[layer] swapchain {:?} {}x{} fmt={:?} hdr={} pass_through={} images={}",
             swapchain,
             state.width,
             state.height,
             state.format,
             state.hdr_kind,
-            state.pass_through
+            state.pass_through,
+            state.images.len()
         );
         self.state.lock().unwrap().swapchains.insert(swapchain, state);
         LayerResult::Handled(Ok(swapchain))
+    }
+
+    fn get_device_queue(&self, queue_family_index: u32, queue_index: u32) -> LayerResult<vk::Queue> {
+        let Some(next) = self.next_get_device_queue else { return LayerResult::Unhandled };
+        let mut queue = vk::Queue::null();
+        // SAFETY: `next` was resolved from the next layer/driver's own proc-addr
+        // table; `queue_family_index`/`queue_index` are the caller's own, forwarded
+        // unchanged.
+        unsafe { next(self.device.handle(), queue_family_index, queue_index, &mut queue) };
+        self.state.lock().unwrap().queue_families.insert(queue, queue_family_index);
+        LayerResult::Handled(queue)
+    }
+
+    fn get_device_queue2(&self, queue_info: &vk::DeviceQueueInfo2) -> LayerResult<vk::Queue> {
+        let Some(next) = self.next_get_device_queue2 else { return LayerResult::Unhandled };
+        let mut queue = vk::Queue::null();
+        // SAFETY: `next` was resolved from the next layer/driver's own proc-addr
+        // table; `queue_info` is valid for the duration of this call (handed to us by
+        // the loader for exactly this call).
+        unsafe { next(self.device.handle(), queue_info, &mut queue) };
+        self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index);
+        LayerResult::Handled(queue)
     }
 
     fn destroy_swapchain_khr(
@@ -231,23 +296,59 @@ impl DeviceHooks for DlssnrDeviceInfo {
             return LayerResult::Unhandled;
         };
         if crate::layer_enabled() {
-            // SAFETY: `p_swapchains`/`swapchain_count` are a valid slice for the
-            // duration of this call -- part of the `VkPresentInfoKHR` the loader just
-            // handed us.
-            let swapchains = unsafe {
-                std::slice::from_raw_parts(present_info.p_swapchains, present_info.swapchain_count as usize)
+            // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
+            // parallel pair of slices for the duration of this call -- part of the
+            // `VkPresentInfoKHR` the loader just handed us.
+            let (swapchains, image_indices) = unsafe {
+                (
+                    std::slice::from_raw_parts(present_info.p_swapchains, present_info.swapchain_count as usize),
+                    std::slice::from_raw_parts(present_info.p_image_indices, present_info.swapchain_count as usize),
+                )
             };
             let mut state = self.state.lock().unwrap();
-            for &sc in swapchains {
+            for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 if sw.pass_through {
                     continue;
                 }
-                if claim_primary(self.device.handle(), sc, sw.width, sw.height) {
-                    // Exercises the SHM state machine end to end -- the fail-open
-                    // budget, the dead/retry timer -- without touching any pixels yet.
-                    // See the module doc comment: real capture/compose is milestone 4.
-                    state.shm.try_round_trip();
+                if !claim_primary(self.device.handle(), sc, sw.width, sw.height) {
+                    break;
+                }
+                let Some(&image) = sw.images.get(image_index as usize) else { break };
+                let Some(&queue_family) = state.queue_families.get(&queue) else {
+                    // We've never seen this queue via a hooked `vkGetDeviceQueue`/
+                    // `vkGetDeviceQueue2` call (e.g. an app using `VK_KHR_synchronization2`
+                    // queue submission paths this layer doesn't intercept) -- no family
+                    // to build a command pool on, so fail open rather than guess one.
+                    break;
+                };
+                let width = sw.width;
+                let height = sw.height;
+                let proxy_format = swapchain::proxy_format_for(sw.format);
+                let State { shm, capture, .. } = &mut *state;
+                if let Some(instance) = &self.instance {
+                    // SAFETY: `queue` is the same queue this present call was made on,
+                    // externally synchronized for its duration by the same Vulkan rule
+                    // that lets the caller call `vkQueuePresentKHR` on it at all right
+                    // after this returns -- exactly this function's own safety
+                    // contract. `image` is one of `sc`'s own images, currently
+                    // `PRESENT_SRC_KHR` per `vkQueuePresentKHR`'s precondition on every
+                    // image it's about to present.
+                    unsafe {
+                        capture::run(
+                            &self.device,
+                            instance,
+                            self.physical_device,
+                            queue,
+                            queue_family,
+                            image,
+                            width,
+                            height,
+                            proxy_format,
+                            capture,
+                            shm,
+                        );
+                    }
                 }
                 break;
             }

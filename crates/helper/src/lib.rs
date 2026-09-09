@@ -4,6 +4,7 @@
 //! binary wrapper around this.
 
 pub mod abi;
+pub mod frame;
 pub mod guard;
 pub mod logging;
 pub mod ngx;

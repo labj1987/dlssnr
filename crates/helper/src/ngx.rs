@@ -254,14 +254,44 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         return s;
     }
 
-    // A 1x1 placeholder: this proves the create call chain (and therefore the
-    // caller-identity spoof and the SEH guard around a real DLL call) end to end. Real
-    // sizing arrives with milestone 4, once there's an actual frame to build the
-    // feature at the size of.
-    if !create_feature_at(&mut s, 1, 1) {
-        s.disabled = true;
-    }
+    // Feature creation is deferred to `ensure_feature`, called once the per-frame
+    // loop (`main.rs`) knows a real width/height -- there is no real frame to build it
+    // at the size of yet at this point in startup.
     s
+}
+
+impl NgxSnippet {
+    pub fn evaluate_feature_fn(&self) -> Option<abi::FnVkEvaluateFeature> {
+        self.evaluate_feature
+    }
+
+    pub fn params(&self) -> abi::NgxParameter {
+        self.params
+    }
+
+    pub fn has_feature(&self) -> bool {
+        !self.feature.is_null()
+    }
+}
+
+/// Creates the feature at `width`x`height` if one doesn't already exist. A no-op
+/// (returns whatever [`NgxSnippet::has_feature`] already reports) once a feature
+/// exists -- this crate doesn't yet handle resizing/rebuilding on a size change (see
+/// `dlssnr_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
+/// design this would eventually hook into); most games never resize their swapchain
+/// mid-session, and a size change today is simply not picked up until the helper
+/// restarts.
+pub fn ensure_feature(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
+    if s.disabled {
+        return false;
+    }
+    if s.has_feature() {
+        return true;
+    }
+    if width == 0 || height == 0 {
+        return false;
+    }
+    create_feature_at(s, width, height)
 }
 
 fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {

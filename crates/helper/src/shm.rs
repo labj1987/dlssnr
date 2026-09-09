@@ -9,7 +9,7 @@
 
 use std::ffi::c_void;
 
-use dlssnr_protocol::{shm_default_path, HEADER_BYTES};
+use dlssnr_protocol::{answer_offset, proxy_offset, shm_default_path, shm_total_bytes, MAX_FRAME};
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -150,13 +150,14 @@ pub fn open() -> Option<ShmMapping> {
     let mut base: *mut c_void = std::ptr::null_mut();
     const ALIGN: usize = 64 * 1024;
     const HINT_BASE: usize = 0x0000_2000_0000_0000;
+    let map_size = shm_total_bytes();
     for i in 0..128usize {
         let hint = (HINT_BASE + i * (2 << 20)) as *mut c_void;
         // SAFETY: `mapping` is valid; a hinted address that the OS refuses is simply
         // not used (Windows either honors the hint exactly or fails the call outright
         // for `MapViewOfFileEx`, unlike Linux's `MAP_FIXED_NOREPLACE` semantics, but
         // trying several hints and moving on from any that fail is safe either way).
-        let view = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, HEADER_BYTES, hint) };
+        let view = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, map_size, hint) };
         if !view.is_null() {
             if (view as usize) % ALIGN == 0 {
                 base = view;
@@ -169,7 +170,7 @@ pub fn open() -> Option<ShmMapping> {
     }
     if base.is_null() {
         // SAFETY: `mapping` is valid; requesting an OS-chosen address is always legal.
-        base = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, HEADER_BYTES, std::ptr::null_mut()) };
+        base = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, map_size, std::ptr::null_mut()) };
     }
     if base.is_null() {
         unsafe {
@@ -180,8 +181,8 @@ pub fn open() -> Option<ShmMapping> {
     }
 
     let header = base.cast::<dlssnr_protocol::ShmHeader>();
-    // SAFETY: `header` points at a fresh `HEADER_BYTES`-sized mapping, large enough for
-    // `ShmHeader` (enforced at compile time in `dlssnr_protocol`).
+    // SAFETY: just mapped above, `shm_total_bytes()` is large enough for `ShmHeader`
+    // (enforced at compile time in `dlssnr_protocol`) plus both pixel regions.
     let hdr = unsafe { &*header };
     if !hdr.is_valid() {
         hdr.init_defaults();
@@ -191,6 +192,33 @@ pub fn open() -> Option<ShmMapping> {
 }
 
 impl ShmMapping {
+    fn pixel_base(&self) -> *mut u8 {
+        self.header.cast::<u8>()
+    }
+
+    /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes from the proxy region --
+    /// the frame the layer captured, waiting to be evaluated.
+    pub fn read_proxy(&self, out: &mut [u8]) -> usize {
+        let n = out.len().min(MAX_FRAME);
+        // SAFETY: `pixel_base()` is the start of this process's own mapping of the
+        // full `shm_total_bytes()` region (see `open` above); `proxy_offset()..+n` is
+        // in bounds for any `n <= MAX_FRAME` by that region's own definition.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.pixel_base().add(proxy_offset()), out.as_mut_ptr(), n);
+        }
+        n
+    }
+
+    /// Writes `bytes` (truncated to `MAX_FRAME`) into the answer region -- the model's
+    /// raw output, for the layer's composition pass to read back.
+    pub fn write_answer(&self, bytes: &[u8]) {
+        let n = bytes.len().min(MAX_FRAME);
+        // SAFETY: same reasoning as `read_proxy`, mirrored for the answer region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pixel_base().add(answer_offset()), n);
+        }
+    }
+
     /// # Safety
     /// Must not be called while any other code still holds a reference derived from
     /// `self.header`.

@@ -7,17 +7,19 @@
 //!
 //! Milestone 2 scope: the request/response sequence-number handshake and the fail-open
 //! timing budget, ported for shape from upstream's `ShmOpen`/`ShmNeuralEnabled`/
-//! `ShmProcessFrame`. It does **not** yet touch the pixel regions (`kMaxFrame`-sized
-//! proxy/answer buffers) — there is no real GPU capture/compose pipeline until
-//! milestone 4, so there would be nothing meaningful to copy into them yet. Mapping and
-//! using those regions is exactly the follow-up milestone 4 needs to add here.
+//! `ShmProcessFrame`.
+//!
+//! Milestone 4 adds [`ShmClient::write_proxy`]/[`ShmClient::read_answer`]: the mapping
+//! now covers the full `dlssnr_protocol::shm_total_bytes()` region (header plus both
+//! `MAX_FRAME`-sized pixel buffers), not just the header, so the proxy/answer bytes
+//! live in the same `mmap` this type already owns rather than a second one.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use dlssnr_protocol::{enums::helper_state, shm_default_path, HEADER_BYTES, SHM_MAGIC};
+use dlssnr_protocol::{enums::helper_state, shm_default_path, MAX_FRAME, SHM_MAGIC};
 
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
 /// per device, guarded by a `Mutex` in [`crate::device::DlssnrDeviceInfo`].
@@ -59,10 +61,71 @@ impl Default for ShmClient {
 
 impl ShmClient {
     fn header(&self) -> Option<&dlssnr_protocol::ShmHeader> {
-        // SAFETY: non-null only after a successful `open()`, which mmaps at least
-        // `HEADER_BYTES` at this address and never unmaps it for the lifetime of the
-        // process.
+        // SAFETY: non-null only after a successful `open()`, which mmaps
+        // `dlssnr_protocol::shm_total_bytes()` at this address and never unmaps it for
+        // the lifetime of the process.
         (!self.header.is_null()).then(|| unsafe { &*self.header })
+    }
+
+    /// Records what the proxy bytes about to be written actually are -- the helper
+    /// (and, on the way back, this same layer reading the answer) needs `width`/
+    /// `height`/`proxy_format` to know how many of the region's bytes are real for
+    /// this frame, not the full `MAX_FRAME`-sized reservation. Call before
+    /// [`Self::write_proxy`]/[`Self::try_round_trip`] so the helper never observes the
+    /// `seq_req` bump before it can see what raster it describes.
+    pub fn set_frame_info(&self, width: u32, height: u32, proxy_format: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.width.store(width, Ordering::Relaxed);
+        hdr.height.store(height, Ordering::Relaxed);
+        hdr.proxy_format.store(proxy_format, Ordering::Relaxed);
+    }
+
+    /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
+    /// fields in `ShmHeader`) into the proxy region -- the frame the layer is about to
+    /// hand the model. Call before bumping `seq_req` (via [`Self::try_round_trip`]):
+    /// the helper only starts reading once it observes that bump, so there is no
+    /// concurrent-write hazard to guard against the way the header's atomics do.
+    ///
+    /// # Safety
+    /// Must only be called after a successful [`Self::open`]/[`Self::try_round_trip`].
+    pub fn write_proxy(&self, bytes: &[u8]) {
+        let Some(base) = self.pixel_base() else { return };
+        let n = bytes.len().min(MAX_FRAME);
+        // SAFETY: `base` is the start of this process's own mapping of the full
+        // `shm_total_bytes()` region (see `open_at`); `proxy_offset()..+n` is in bounds
+        // for any `n <= MAX_FRAME` by that region's own definition.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                base.add(dlssnr_protocol::proxy_offset()),
+                n,
+            );
+        }
+    }
+
+    /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes back from the answer
+    /// region into `out`, returning the number of bytes copied. Meaningful only after
+    /// [`Self::try_round_trip`] has returned `true` for the request this answer goes
+    /// with -- reading it any earlier just observes whatever the helper last wrote
+    /// (stale or all-zero), which is why this never blocks or checks sequence numbers
+    /// itself; the caller already knows from the round trip's own return value whether
+    /// there is a real answer to read.
+    pub fn read_answer(&self, out: &mut [u8]) -> usize {
+        let Some(base) = self.pixel_base() else { return 0 };
+        let n = out.len().min(MAX_FRAME);
+        // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base.add(dlssnr_protocol::answer_offset()),
+                out.as_mut_ptr(),
+                n,
+            );
+        }
+        n
+    }
+
+    fn pixel_base(&self) -> Option<*mut u8> {
+        (!self.header.is_null()).then_some(self.header as *mut u8)
     }
 
     /// Opens (or creates) the mapping if not already attached. Idempotent.
@@ -120,14 +183,17 @@ impl ShmClient {
         }
 
         // SAFETY: `fd` is a valid, open file descriptor sized to at least `total` bytes
-        // by the ftruncate above (or already that size); mapping only the first
-        // `HEADER_BYTES` of it is always in-bounds. The mapping is kept for the rest of
-        // the process's life, so the returned pointer stays valid for as long as
-        // anything derived from it (`header()`'s `&ShmHeader`) is used.
+        // by the ftruncate above (or already that size); mapping the whole `total`
+        // bytes (header plus both pixel regions) is always in-bounds. The mapping is
+        // kept for the rest of the process's life, so the returned pointer stays valid
+        // for as long as anything derived from it (`header()`'s `&ShmHeader`, or the
+        // proxy/answer slices below) is used. A `MAP_SHARED` file mapping is a sparse,
+        // page-cache-backed region -- reserving the full `MAX_FRAME*2` up front costs
+        // no real memory beyond whatever pages an SDR session actually touches.
         let map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                HEADER_BYTES,
+                total,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),

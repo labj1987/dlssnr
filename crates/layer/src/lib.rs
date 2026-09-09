@@ -13,11 +13,21 @@
 //! [`vulkan_layer::DeviceHooks`] for the handful of functions it actually cares about;
 //! everything else falls through to the next layer/driver automatically.
 //!
-//! TODO(milestone 4, see /home/alex/.claude/plans/breezy-napping-waffle.md): real
-//! capture/compose (currently `queue_present_khr` always presents the original,
-//! unmodified frame), device-extension injection for the dma-buf transport, the
-//! inert-on-non-NVIDIA-device check, `pidfd_getfd` descriptor adoption, hotkey polling.
+//! Milestone 4 status: `queue_present_khr` now really captures the primary swapchain's
+//! image into the shared-memory proxy region and writes a result back (`capture.rs`)
+//! instead of always presenting the frame unmodified. Still open: the real GPU compute
+//! composition (`composition/`'s math is real and tested but not yet dispatched --
+//! `capture.rs` currently writes the captured bytes straight back, an identity
+//! passthrough through the transport rather than a real edit), the
+//! inert-on-non-NVIDIA-device check, `pidfd_getfd` descriptor adoption (an optional
+//! future zero-copy optimization, not required for the transport that exists today),
+//! hotkey polling. Also open: real cross-process arbitration for which swapchain gets
+//! to be "primary" -- today's `device::PRIMARY` only elects one per *process*, so a
+//! second Vulkan process (the Steam overlay, observed in testing) independently elects
+//! its own small swapchain as primary too; `swapchain::is_plausible_game_size` is a
+//! blunt, documented-as-such filter for that, not a real fix.
 
+mod capture;
 mod composition;
 mod device;
 mod logging;
@@ -25,13 +35,22 @@ mod shm;
 mod swapchain;
 
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use once_cell::sync::Lazy;
 use vulkan_layer::{declare_introspection_queries, Global, Layer, LayerManifest, StubGlobalHooks, StubInstanceInfo};
 
 use device::DlssnrDeviceInfo;
+
+/// The most recently created `VkInstance`, so `create_device_info` (which the
+/// `vulkan_layer` framework calls with no way to reach whatever `create_instance_info`
+/// returned -- see that method's own doc comment) can still get an `ash::Instance` to
+/// query physical-device memory properties from when it builds capture resources.
+/// Games overwhelmingly create exactly one `VkInstance`; a plain "last one wins" slot
+/// is the same simplification `device::PRIMARY` already makes for the analogous
+/// one-swapchain-at-a-time assumption.
+static CURRENT_INSTANCE: Mutex<Option<Arc<ash::Instance>>> = Mutex::new(None);
 
 pub const LAYER_NAME: &str = "VK_LAYER_dlssnr_neural";
 
@@ -82,21 +101,28 @@ impl Layer for DlssnrLayer {
         &self,
         _create_info: &vk::InstanceCreateInfo,
         _allocator: Option<&vk::AllocationCallbacks>,
-        _instance: Arc<ash::Instance>,
+        instance: Arc<ash::Instance>,
         _next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     ) -> Self::InstanceInfoContainer {
+        *CURRENT_INSTANCE.lock().unwrap() = Some(instance);
         Default::default()
     }
 
     fn create_device_info(
         &self,
-        _physical_device: vk::PhysicalDevice,
+        physical_device: vk::PhysicalDevice,
         _create_info: &vk::DeviceCreateInfo,
         _allocator: Option<&vk::AllocationCallbacks>,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     ) -> Self::DeviceInfoContainer {
-        DlssnrDeviceInfo::new(device, next_get_device_proc_addr)
+        // `create_instance_info` always runs before `create_device_info` for the
+        // instance a device is created against (the app must call `vkCreateInstance`
+        // before `vkCreateDevice`), so this is always `Some` in practice; `unwrap_or`
+        // only matters for a hypothetical device created against an instance from
+        // before this layer was loaded, which never happens for an implicit layer.
+        let instance = CURRENT_INSTANCE.lock().unwrap().clone();
+        DlssnrDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr)
     }
 }
 
