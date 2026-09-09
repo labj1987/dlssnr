@@ -315,6 +315,22 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   mapping and read/write settings" utility both `gui` and `cli` share, deliberately
   kept separate from `dlssnr_layer::shm::ShmClient` (which is entangled with the
   request/response round-trip state machine the GUI/CLI have no reason to depend on).
+- **NGX binaries import row, added later (2026-09-09)**: the Status group's "NGX
+  binaries" row has a real "Import…" button — this was missing when README.md first
+  claimed it existed (a documentation bug, caught when Alex went looking for it in the
+  running app and couldn't find it). `crates/gui/src/binaries.rs` holds the path
+  (`XDG_DATA_HOME/dlssnr/binaries`, duplicated from `cli/src/paths.rs::binaries_dir`
+  rather than shared — four lines, not worth a shared crate) and the copy logic, real-
+  tested by `cargo test -p dlssnr-gui` (`import_from_copies_known_files_and_skips_unknown_ones`,
+  confirms known DLLs are copied and unrelated files are not). The button opens a
+  `gtk4::FileDialog::select_folder`, copies via that same function, and shows an
+  `adw::Toast` with the result. **Same sandbox limitation as the write-back path
+  above blocks confirming the actual click-through**: verified instead by temporarily
+  reducing `build_ui` to just the Status group so it would render without needing the
+  scroll this sandbox also can't inject, screenshotting it (row and subtitle render
+  correctly, "nvngx_dlssnr.dll missing" reflecting the real absence of the file), then
+  reverting that temporary reduction — the underlying `import_from` logic is what the
+  test above actually exercises.
 
 ## `cli` (milestone 5, real and tested — including one real bug caught by an actual
 ## process-group kill test)

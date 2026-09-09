@@ -138,29 +138,37 @@ pub fn build_ui(app: &adw::Application) {
     let (hdr_mode, set_hdr_mode) = bind_u32(&shm, |h| &h.hdr_mode);
     comp_group.add(&combo_row("HDR input", &["Auto", "Off", "Force float16"], hdr_mode, set_hdr_mode));
 
+    let toasts = adw::ToastOverlay::new();
+
     page.add(&model_group);
     page.add(&motion_group);
     page.add(&comp_group);
-    page.add(&build_status_group(&shm));
+    page.add(&build_status_group(&shm, &toasts));
 
     let header = adw::HeaderBar::new();
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&page);
+    toasts.set_child(Some(&content));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("dlssnr")
         .default_width(620)
         .default_height(760)
-        .content(&content)
+        .content(&toasts)
         .build();
     window.present();
 }
 
 /// A read-only status group, refreshed on a timer -- helper/layer liveness, frame
 /// counts. Nothing here is a setting; it only ever reads.
-fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+///
+/// The one exception is the "NGX binaries" row's Import button: unlike everything
+/// else here, it's an action, not a live readout, because it's the only place besides
+/// `dlssnr-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
+/// no separate menu for it.
+fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
 
@@ -181,7 +189,43 @@ fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>) -
         glib::ControlFlow::Continue
     });
 
+    let binaries_row = adw::ActionRow::new();
+    binaries_row.set_title("NGX binaries");
+    binaries_row.set_subtitle(&binaries_status_subtitle());
+    let import_button = gtk4::Button::with_label("Import…");
+    import_button.set_valign(gtk4::Align::Center);
+    binaries_row.add_suffix(&import_button);
+    group.add(&binaries_row);
+
+    let toasts = toasts.clone();
+    import_button.connect_clicked(move |button| {
+        let toasts = toasts.clone();
+        let binaries_row = binaries_row.clone();
+        let parent = button.root().and_downcast::<gtk4::Window>();
+        let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
+        dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+            let Ok(folder) = result else { return };
+            let Some(path) = folder.path() else { return };
+            match crate::binaries::import_from(&path) {
+                Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
+                Ok(n) => {
+                    toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
+                    binaries_row.set_subtitle(&binaries_status_subtitle());
+                }
+                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
+            }
+        });
+    });
+
     group
+}
+
+fn binaries_status_subtitle() -> String {
+    if crate::binaries::dir().join("nvngx_dlssnr.dll").is_file() {
+        "nvngx_dlssnr.dll present".to_string()
+    } else {
+        "nvngx_dlssnr.dll missing".to_string()
+    }
 }
 
 fn helper_state_label(state: u32) -> &'static str {
