@@ -1,20 +1,12 @@
-//! Where `dlssnr-cli import-binaries` puts NVIDIA's NGX DLLs, and the same copy the
-//! CLI does -- duplicated rather than shared because it's four lines and the two
-//! crates otherwise share nothing filesystem-related (the GUI only ever talks to the
-//! helper over the SHM mapping, never touches paths, apart from this one exception).
+//! Importing NVIDIA's NGX DLLs into `dlssnr_supervisor::paths::binaries_dir()` --
+//! the same destination `dlssnr-cli import-binaries` uses. The path itself now comes
+//! from the shared `dlssnr-supervisor` crate; only the actual file-copy loop is kept
+//! here, since it's a handful of lines with nothing else in `supervisor` needing it.
 
 const NGX_FILES: [&str; 3] = ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"];
 
 pub fn dir() -> std::path::PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-            std::path::PathBuf::from(home).join(".local/share")
-        });
-    data_home.join("dlssnr").join("binaries")
+    std::path::PathBuf::from(dlssnr_supervisor::paths::binaries_dir())
 }
 
 /// Copies whichever of the known NGX DLLs are present in `src` into [`dir`]. Returns

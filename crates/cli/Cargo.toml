@@ -12,9 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 dlssnr-protocol = { path = "../protocol" }
+dlssnr-supervisor = { path = "../supervisor" }
 anyhow = "1"
-libc = "0.2"
-# Process-group supervision (setsid, signaling a whole group) -- the one place
-# upstream's bash script was doing something bash is naturally good at (see
-# process.rs's doc comment for why this needed care to actually replicate).
-nix = { version = "0.29", features = ["process", "signal"] }

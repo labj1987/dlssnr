@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/layer",
     "crates/helper",
+    "crates/supervisor",
     "crates/gui",
     "crates/cli",
 ]
@@ -13,6 +14,7 @@ members = [
 default-members = [
     "crates/protocol",
     "crates/layer",
+    "crates/supervisor",
     "crates/gui",
     "crates/cli",
 ]

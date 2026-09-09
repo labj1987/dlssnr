@@ -86,8 +86,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
- "libc",
- "nix",
+ "dlssnr-supervisor",
 ]
 
 [[package]]
@@ -96,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
+ "dlssnr-supervisor",
  "gio",
  "glib",
  "gtk4",
@@ -126,6 +126,15 @@ name = "dlssnr-protocol"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "dlssnr-supervisor"
+version = "0.1.0"
+dependencies = [
+ "dlssnr-protocol",
+ "libc",
+ "nix",
 ]
 
 [[package]]

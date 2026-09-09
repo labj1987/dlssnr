@@ -191,20 +191,58 @@ fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>, t
 
     let helper_row = adw::ActionRow::new();
     helper_row.set_title("Helper");
+    let start_stop_button = gtk4::Button::with_label("Start");
+    start_stop_button.set_valign(gtk4::Align::Center);
+    helper_row.add_suffix(&start_stop_button);
     let layer_row = adw::ActionRow::new();
     layer_row.set_title("Layer");
     group.add(&helper_row);
     group.add(&layer_row);
 
     let shm_for_timer = std::sync::Arc::clone(shm);
+    let start_stop_button_for_timer = start_stop_button.clone();
     glib::timeout_add_seconds_local(1, move || {
         let hdr = shm_for_timer.header();
         let helper_state = hdr.helper_state.load(Ordering::Relaxed);
         helper_row.set_subtitle(helper_state_label(helper_state));
         let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
         layer_row.set_subtitle(if attached { "attached" } else { "not attached" });
+        // Keyed off the actual OS-level pid-file check (what start/stop manage), not
+        // the SHM helper_state above -- those can briefly disagree right after a
+        // start/stop (e.g. STARTING vs. the process not existing yet) and the button
+        // should reflect what clicking it will actually do, not the helper's own
+        // self-reported state.
+        if start_stop_button_for_timer.is_sensitive() {
+            start_stop_button_for_timer.set_label(if dlssnr_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+        }
         glib::ControlFlow::Continue
     });
+
+    {
+        let toasts = toasts.clone();
+        start_stop_button.connect_clicked(move |button| {
+            let toasts = toasts.clone();
+            if dlssnr_supervisor::is_running().is_some() {
+                // Stopping waits up to 5s for a graceful exit before escalating to
+                // SIGKILL (see dlssnr_supervisor::stop) -- a brief, bounded main-thread
+                // block on an explicit user click, not worth the async plumbing this
+                // small a GUI doesn't otherwise need.
+                button.set_sensitive(false);
+                button.set_label("Stopping…");
+                match dlssnr_supervisor::stop(std::time::Duration::from_secs(5)) {
+                    Ok(()) => toasts.add_toast(adw::Toast::new("Helper stopped")),
+                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
+                }
+                button.set_sensitive(true);
+            } else {
+                let cfg = dlssnr_supervisor::Config::load();
+                match dlssnr_supervisor::start(&cfg) {
+                    Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper started (pid {})", started.pid))),
+                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Start failed: {e}"))),
+                }
+            }
+        });
+    }
 
     let binaries_row = adw::ActionRow::new();
     binaries_row.set_title("NGX binaries");

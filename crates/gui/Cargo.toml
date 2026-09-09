@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 dlssnr-protocol = { path = "../protocol" }
+dlssnr-supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_4", "v1_5"] }
 glib = "0.22"

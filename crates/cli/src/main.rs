@@ -4,17 +4,13 @@
 //! upstream's expression of it) reimplemented in Rust, sharing logic with the GUI
 //! through `dlssnr_protocol` instead of duplicating it in shell.
 
-mod config;
 mod gpu;
-mod install_dir;
-mod paths;
-mod process;
 mod runners;
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use config::Config;
+use dlssnr_supervisor::{install_dir, paths, Config};
 
 fn usage() {
     eprintln!(
@@ -32,10 +28,6 @@ fn usage() {
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
          \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir"
     );
-}
-
-fn pid_file() -> String {
-    format!("{}/helper.pid", dlssnr_protocol::shm_runtime_dir())
 }
 
 fn default_config() -> Config {
@@ -124,7 +116,7 @@ fn cmd_detect_gpu() -> ExitCode {
 }
 
 fn cmd_status() -> ExitCode {
-    match process::running_pid(&pid_file()) {
+    match dlssnr_supervisor::is_running() {
         Some(pid) => println!("helper running (pid {pid})"),
         None => println!("helper not running"),
     }
@@ -211,60 +203,27 @@ fn cmd_setup() -> ExitCode {
 }
 
 fn cmd_start() -> ExitCode {
-    if process::running_pid(&pid_file()).is_some() {
-        println!("helper already running");
-        return ExitCode::SUCCESS;
-    }
     let cfg = Config::load();
-    let Some(helper) = install_dir::helper_exe() else {
-        eprintln!("error: dlssnr_helper.exe not found");
-        return ExitCode::FAILURE;
-    };
-    if cfg.runner_path.is_empty() {
-        eprintln!("error: no runner configured (run `dlssnr-cli init` first)");
-        return ExitCode::FAILURE;
-    }
-
-    let mut envs = vec![
-        ("WINEPREFIX".to_string(), paths::prefix_dir()),
-        ("DLSSNR_SHM".to_string(), cfg.shm.clone()),
-        ("DLSSNR_LOG".to_string(), cfg.log.clone()),
-        ("DLSSNR_BIN_DIR".to_string(), format!("Z:{}", cfg.binaries)),
-        ("WINEDEBUG".to_string(), "-all".to_string()),
-    ];
-    // SAFETY-relevant only in the "matches a real deployment" sense, not memory
-    // safety: DLSSNR_UID has to be the same value the layer computes
-    // `shm_runtime_dir()` from, which reads it from the environment too -- passing it
-    // explicitly here is what keeps both sides pointed at the same file.
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    envs.push(("DLSSNR_UID".to_string(), uid.to_string()));
-
-    let (program, args): (String, Vec<String>) = if cfg.runner_type == "proton" {
-        envs.push(("PROTON_ENABLE_NVAPI".to_string(), "1".to_string()));
-        envs.push(("DLSSNR_SKIP_NVAPI".to_string(), "1".to_string()));
-        envs.push(("STEAM_COMPAT_DATA_PATH".to_string(), paths::prefix_dir()));
-        (cfg.runner_path.clone(), vec!["run".to_string(), helper.display().to_string()])
-    } else {
-        (cfg.runner_path.clone(), vec![helper.display().to_string()])
-    };
-
-    match process::start_detached(&program, &args, &envs, &cfg.log, &pid_file()) {
-        Ok(pid) => {
-            println!("helper started (pid {pid})");
-            println!("  runner: {} {}", cfg.runner_type, cfg.runner_path);
-            println!("  log: {}", cfg.log);
+    match dlssnr_supervisor::start(&cfg) {
+        Ok(started) => {
+            println!("helper started (pid {})", started.pid);
+            println!("  runner: {} {}", started.runner_type, started.runner_path);
+            println!("  log: {}", started.log);
+            ExitCode::SUCCESS
+        }
+        Err(dlssnr_supervisor::StartError::AlreadyRunning(_)) => {
+            println!("helper already running");
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("failed to start helper: {e}");
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn cmd_stop() -> ExitCode {
-    match process::stop(&pid_file(), Duration::from_secs(5)) {
+    match dlssnr_supervisor::stop(Duration::from_secs(5)) {
         Ok(()) => {
             println!("helper stopped");
             ExitCode::SUCCESS

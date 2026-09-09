@@ -1,0 +1,15 @@
+[package]
+name = "dlssnr-supervisor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared helper-process supervision (config, paths, start/stop) for dlssnr-cli and dlssnr-gui"
+
+[dependencies]
+dlssnr-protocol = { path = "../protocol" }
+libc = "0.2"
+# Process-group supervision (setsid, signaling a whole group) -- see process.rs's
+# doc comment for why this needed care to actually replicate upstream's bash script's
+# `setsid ...` / `kill -TERM -- -$pid` semantics.
+nix = { version = "0.29", features = ["process", "signal"] }

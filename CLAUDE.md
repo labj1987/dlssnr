@@ -332,6 +332,37 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   reverting that temporary reduction — the underlying `import_from` logic is what the
   test above actually exercises.
 
+## `supervisor` (added 2026-09-09: extracted from `cli` so the GUI can start/stop too)
+
+`crates/cli/src/{paths,config,install_dir,process}.rs` moved verbatim into a new
+`dlssnr-supervisor` lib crate (`git mv`, not rewritten) after Alex noticed the GUI had
+no start/stop control at all — only the CLI did. Rather than duplicate the
+runner-selection/env-var-construction logic `cmd_start` had (a real risk of drift
+between two copies, unlike the four-line NGX-binaries path the GUI already duplicates
+on purpose), it's now `dlssnr_supervisor::start(&Config) -> Result<StartedHelper,
+StartError>` / `stop(Duration)` / `is_running()`, called identically by both `cli` and
+`gui`. `cli`'s `cmd_start`/`cmd_stop` are now thin wrappers that just format
+`StartError`'s `Display` output — confirmed byte-for-byte identical CLI output
+before/after (`status`, `doctor`, `start`'s `HelperNotFound` error path, `stop`'s
+no-helper-running no-op) by running each for real, plus the full test suite
+(`cargo test`, workspace-wide) staying green, including
+`process.rs`'s `stop_kills_the_whole_process_group_not_just_the_leader` moving over
+still correctly `#[ignore]`d for the same sandbox reason documented below. `gui`'s
+`binaries.rs` also lost its own duplicated `dir()` in favor of
+`dlssnr_supervisor::paths::binaries_dir()`, now that a real shared crate exists for
+exactly this.
+
+The GUI's Status group's Helper row now has a Start/Stop button (`ui.rs`), keyed off
+`dlssnr_supervisor::is_running()` (the actual pid-file check), not the SHM
+`helper_state` the row's subtitle shows — those two can briefly disagree right after a
+click. Confirmed rendering correctly via the same reduced-`build_ui`-then-screenshot
+trick used for the NGX-import button (real screenshot: row present, labeled "Start",
+matching the real "stopped" state) — **actual click-through is unverified**, same
+sandbox input-routing limitation as everywhere else in this GUI. `stop()` blocks the
+GTK main thread for up to 5s (graceful-then-SIGKILL) on click; deliberately not made
+async since this GUI has no async runtime wired up at all (no `tokio`, unlike the
+sibling apps) and adding one for one button wasn't judged worth it.
+
 ## `cli` (milestone 5, real and tested — including one real bug caught by an actual
 ## process-group kill test)
 
