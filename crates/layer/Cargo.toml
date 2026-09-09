@@ -1,0 +1,23 @@
+[package]
+name = "dlssnr-layer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Vulkan implicit layer: captures presented frames, runs the composition, talks to the helper over shared memory"
+
+[lib]
+name = "dlssnr_layer"
+crate-type = ["cdylib"]
+
+[dependencies]
+dlssnr-protocol = { path = "../protocol" }
+# Pinned to the exact commit vulkan-layer itself was built against, and ash pinned to
+# the exact version vulkan-layer depends on (0.37.3): vulkan-layer's public API is
+# expressed in terms of `ash::vk` types, and Cargo treats different 0.x versions of the
+# same crate as separate, incompatible types -- a mismatched ash version here would
+# fail to compile against vulkan-layer's trait signatures, not just risk skew.
+ash = "=0.37.3"
+vulkan-layer = { git = "https://github.com/google/vk-layer-for-rust", rev = "102d87cd9781c045b232e77eef198eed75ce8a8c" }
+once_cell = "1"
+libc = "0.2"

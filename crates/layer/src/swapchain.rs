@@ -1,0 +1,58 @@
+//! Per-swapchain state, and what a swapchain's format/colour space say about the light
+//! it carries.
+
+use ash::vk;
+use dlssnr_protocol::enums::hdr_kind;
+
+pub struct SwapchainState {
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+    pub hdr_kind: u32,
+    /// True when this swapchain's format isn't one the pass can work with, or it's
+    /// larger than the protocol's ceiling (`dlssnr_protocol::{MAX_W,MAX_H}`) -- it
+    /// presents untouched either way.
+    pub pass_through: bool,
+}
+
+/// Whether this is a format the composition pass can work in. Every one has an 8-bit
+/// UNORM twin the pass can normalize to; the 10-bit and float entries are what let an
+/// HDR game reach the model at all.
+///
+/// This is a starting list covering the common presentable formats, not a claim of
+/// completeness -- widen it if a real game surfaces a swapchain format outside this
+/// set (the layer already fails safely closed: an unrecognized format means
+/// `pass_through`, never a wrong read).
+pub fn is_supported_format(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::A2B10G10R10_UNORM_PACK32
+            | vk::Format::A2R10G10B10_UNORM_PACK32
+            | vk::Format::R16G16B16A16_SFLOAT
+    )
+}
+
+/// What a swapchain's format and colour space together say about the light in the
+/// frame. A float swapchain hands over linear light directly. A ten-bit swapchain in an
+/// HDR10/PQ colour space carries ST 2084 code -- absolute nits, not just more precision
+/// on an already-tone-mapped picture, which is what the same ten-bit format in an SDR
+/// colour space would be.
+pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u32 {
+    if format == vk::Format::R16G16B16A16_SFLOAT {
+        return hdr_kind::LINEAR_FP16;
+    }
+    let ten_bit = matches!(
+        format,
+        vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32
+    );
+    let pq = color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT;
+    if ten_bit && pq {
+        hdr_kind::PQ10
+    } else {
+        hdr_kind::NONE
+    }
+}

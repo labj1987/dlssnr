@@ -1,0 +1,151 @@
+//! VEH + `setjmp`/`longjmp` exception guard.
+//!
+//! MinGW has no `__try`/`__except` (those are MSVC-only C extensions) — which is
+//! exactly why upstream's own C++ helper uses this technique instead of them: install a
+//! process-wide Vectored Exception Handler that, when it fires on this thread while a
+//! [`guarded`] call is in flight, performs a non-local jump straight back to the call
+//! site via `longjmp` rather than letting the fault (or the OS's normal unwind search)
+//! propagate any further. This is what stands between a bad call into
+//! `nvngx_dlssnr.dll` — the whole reason this module exists — and this process going
+//! down with it.
+//!
+//! Ported for shape from `core/guard.h`: the *mechanism*, and the reason for it
+//! (MinGW's missing SEH intrinsics), are upstream's; this is a fresh Rust
+//! implementation using `AddVectoredExceptionHandler` plus a hand-rolled `setjmp`/
+//! `longjmp` FFI boundary, declared directly against `kernel32.dll`/the mingw CRT
+//! rather than through a higher-level wrapper crate — these specific calls are old,
+//! extremely stable parts of the Win32 ABI, and declaring them directly keeps this
+//! module auditable without also depending on how some other crate happens to shape
+//! its own wrapper for them.
+//!
+//! # The one discipline this depends on
+//!
+//! `longjmp` restores the CPU's registers (stack pointer, frame pointer, instruction
+//! pointer) directly — it does **not** run any Rust `Drop` impl for a value that was
+//! live in a stack frame between the [`guarded`] call and the point of the fault, the
+//! same way a C++ destructor in that range would also be skipped by a raw `longjmp`.
+//! Keep every [`guarded`] closure to what upstream's own `Guarded()` call sites are:
+//! a single FFI call plus `Copy` locals, nothing that owns a heap allocation or a lock
+//! that must be released for correctness.
+
+use std::cell::{Cell, UnsafeCell};
+use std::ffi::c_void;
+use std::sync::Once;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn AddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
+}
+
+type VectoredHandler = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+/// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-exception_pointers>
+#[repr(C)]
+struct ExceptionPointers {
+    exception_record: *mut ExceptionRecord,
+    #[allow(dead_code)]
+    context_record: *mut c_void,
+}
+
+/// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-exception_record>
+/// Only the leading fields are named; the trailing `ExceptionInformation` array (whose
+/// exact length depends on `NumberParameters`) is never read here, so it's left out
+/// rather than guessed at.
+#[repr(C)]
+struct ExceptionRecord {
+    exception_code: u32,
+}
+
+/// Opaque `jmp_buf` storage, deliberately over-sized: MinGW-w64's real `jmp_buf` on
+/// x86_64 is smaller than this, and a buffer larger than the real one is always safe
+/// (it just wastes a little thread-local storage) — smaller would not be. The exact
+/// size isn't pinned down more precisely than "generous" because that would need
+/// checking against the real `<setjmp.h>` on this toolchain, which isn't installed on
+/// this dev machine yet; `setjmp`/`longjmp` themselves are declared directly against
+/// the mingw CRT below, so a size mismatch here would show up immediately as memory
+/// corruption the first time this runs under Wine/Proton, not as a silent bug --
+/// exactly the kind of thing to check for in this crate's first real runtime test.
+#[repr(C, align(16))]
+struct JmpBuf([u8; 256]);
+
+extern "C" {
+    fn setjmp(env: *mut JmpBuf) -> i32;
+    fn longjmp(env: *mut JmpBuf, val: i32) -> !;
+}
+
+thread_local! {
+    // `UnsafeCell`, not a plain `JmpBuf`: `setjmp` writes through the raw pointer this
+    // hands out, and mutating through a pointer derived from a `&JmpBuf` with nothing
+    // in between would be exactly the kind of aliasing violation `UnsafeCell` exists to
+    // make legal -- same reasoning as `dlssnr_protocol::ShmHeader`'s seqlock-guarded
+    // fields for the same underlying reason (shared, externally-written memory).
+    static GUARD_JMP: UnsafeCell<JmpBuf> = UnsafeCell::new(JmpBuf([0; 256]));
+    static GUARD_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static GUARD_CODE: Cell<u32> = const { Cell::new(0) };
+}
+
+static INSTALL: Once = Once::new();
+
+/// Installs the process-wide vectored exception handler. Idempotent; call once at
+/// helper startup before any guarded NGX call. Every call to [`guarded`] before this
+/// runs is not actually guarded at all — a fault would go uncaught.
+pub fn install() {
+    INSTALL.call_once(|| {
+        // SAFETY: `veh_handler` matches `VectoredHandler`'s signature exactly. `first =
+        // 1` puts it first in the chain, so a fault during a `guarded` call is seen
+        // here before any handler installed by NGX/the driver/anything else gets a
+        // chance to (mis)handle it.
+        unsafe {
+            AddVectoredExceptionHandler(1, veh_handler);
+        }
+    });
+}
+
+/// Runs `f`, catching any hardware exception (access violation, illegal instruction,
+/// stack overflow, division fault — whatever the CPU raises) that occurs anywhere
+/// inside it, including inside a call across the FFI boundary into `nvngx_dlssnr.dll`.
+/// Returns `(f(), 0)` on success, or `(fail_value, exception_code)` — the raw SEH
+/// `EXCEPTION_*` code — if a fault fired instead.
+///
+/// See the module doc comment for the one discipline this depends on: no local in `f`'s
+/// call frames may need `Drop` to run for correctness.
+pub fn guarded<F: FnOnce() -> R, R>(f: F, fail_value: R) -> (R, u32) {
+    GUARD_CODE.with(|c| c.set(0));
+    // SAFETY: `GUARD_JMP` is this thread's own thread-local storage, stable for the
+    // life of the thread and never touched by any other thread; getting a raw pointer
+    // to it and handing that pointer to `setjmp` is exactly what `setjmp` requires.
+    let jmp_ptr = GUARD_JMP.with(|j| j.get());
+    let did_jump = unsafe { setjmp(jmp_ptr) };
+    if did_jump == 0 {
+        GUARD_ACTIVE.with(|a| a.set(true));
+        let result = f();
+        // Only reached if `f` returned normally -- a fault during `f` never gets here,
+        // it jumps straight to the `else` branch below via `longjmp` instead.
+        GUARD_ACTIVE.with(|a| a.set(false));
+        (result, 0)
+    } else {
+        (fail_value, GUARD_CODE.with(|c| c.get()))
+    }
+}
+
+unsafe extern "system" fn veh_handler(info: *mut ExceptionPointers) -> i32 {
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    if !GUARD_ACTIVE.with(Cell::get) {
+        // Nothing we're watching is running on this thread right now -- not our fault
+        // to handle, let the normal search (the debugger, the process's default
+        // handler, ultimately termination) continue.
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: the OS guarantees `info` and `(*info).exception_record` are valid for the
+    // duration of this call when it invokes a registered vectored handler.
+    let code = unsafe { (*(*info).exception_record).exception_code };
+    GUARD_CODE.with(|c| c.set(code));
+    GUARD_ACTIVE.with(|a| a.set(false));
+    let jmp_ptr = GUARD_JMP.with(|j| j.get());
+    // SAFETY: `jmp_ptr` was set up by a `setjmp` call on this same thread earlier in
+    // this same call chain (guaranteed by `GUARD_ACTIVE` only being true between that
+    // `setjmp` and the matching `guarded()` call returning) -- exactly the precondition
+    // `longjmp` requires. This never returns; the thread resumes at that `setjmp` site.
+    unsafe { longjmp(jmp_ptr, 1) }
+}

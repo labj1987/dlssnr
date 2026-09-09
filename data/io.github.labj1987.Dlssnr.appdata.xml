@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.labj1987.Dlssnr</id>
+  <name>dlssnr</name>
+  <summary>DLSS 5 Neural Rendering settings and helper manager</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      A Vulkan implicit layer and settings GUI for running NVIDIA DLSS 5 Neural
+      Rendering on native Linux and Proton games, with the Windows-side NGX model
+      running under Wine/Proton.
+    </p>
+  </description>
+  <launchable type="desktop-id">dlssnr.desktop</launchable>
+  <provides>
+    <binary>dlssnr-gui</binary>
+    <binary>dlssnr-cli</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

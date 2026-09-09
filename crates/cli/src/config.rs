@@ -1,0 +1,73 @@
+//! The on-disk config file (`~/.config/dlssnr/config.ini`): the same flat
+//! `key=value` format upstream's shell script used (a contract other tooling/the
+//! user's own scripts might already read, and there's no reason to invent a new
+//! format for the same handful of fields), read/written with plain string parsing --
+//! this file is small and hand-written, not something that benefits from a real INI
+//! crate.
+
+use std::collections::BTreeMap;
+
+use crate::paths;
+
+#[derive(Default, Debug, Clone)]
+pub struct Config {
+    pub runner_type: String,
+    pub runner_path: String,
+    pub binaries: String,
+    pub shm: String,
+    pub log: String,
+    pub dxvk_vendor: String,
+    pub dxvk_device: String,
+}
+
+impl Config {
+    pub fn load() -> Self {
+        let Ok(text) = std::fs::read_to_string(paths::config_file()) else {
+            return Self::default();
+        };
+        let mut map = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        let mut cfg = Self {
+            runner_type: map.remove("runner_type").unwrap_or_default(),
+            runner_path: map.remove("runner_path").unwrap_or_default(),
+            binaries: map.remove("binaries").unwrap_or_default(),
+            shm: map.remove("shm").unwrap_or_default(),
+            log: map.remove("log").unwrap_or_default(),
+            dxvk_vendor: map.remove("dxvk_vendor").unwrap_or_default(),
+            dxvk_device: map.remove("dxvk_device").unwrap_or_default(),
+        };
+        // A config written by an older build (or a stray manual edit) pinning the
+        // mapping to $XDG_RUNTIME_DIR is exactly the path a Steam game cannot see
+        // (see dlssnr_protocol's own doc comment on this) -- treat that one value as
+        // unset rather than let it silently reintroduce the bug it exists to avoid.
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            if cfg.shm == format!("{runtime_dir}/dlssnr/shm.bin") {
+                cfg.shm.clear();
+            }
+        }
+        if cfg.shm.is_empty() {
+            cfg.shm = dlssnr_protocol::shm_default_path();
+        }
+        if cfg.log.is_empty() {
+            cfg.log = paths::log_file();
+        }
+        cfg
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        paths::ensure_dirs()?;
+        let text = format!(
+            "runner_type={}\nrunner_path={}\nbinaries={}\nshm={}\nlog={}\ndxvk_vendor={}\ndxvk_device={}\n",
+            self.runner_type, self.runner_path, self.binaries, self.shm, self.log, self.dxvk_vendor, self.dxvk_device,
+        );
+        std::fs::write(paths::config_file(), text)
+    }
+}

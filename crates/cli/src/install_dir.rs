@@ -1,0 +1,43 @@
+//! Where the helper executable and its vendored DXVK DLL live, relative to this
+//! binary's own location — matches the AppImage layout the plan's "Build & packaging"
+//! section describes (`usr/lib/dlssnr/helper/dlssnr_helper.exe`,
+//! `usr/lib/dlssnr/dxvk/...`), not upstream's RPM tree.
+
+use std::path::PathBuf;
+
+fn candidate_install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(explicit) = std::env::var("DLSSNR_INSTALL_DIR") {
+        dirs.push(PathBuf::from(explicit));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            dirs.push(bin_dir.join("../lib/dlssnr"));
+            dirs.push(bin_dir.join("../lib64/dlssnr"));
+            dirs.push(bin_dir.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from("/usr/lib/dlssnr"));
+    dirs.push(PathBuf::from("/usr/lib64/dlssnr"));
+    dirs
+}
+
+pub fn helper_exe() -> Option<PathBuf> {
+    for dir in candidate_install_dirs() {
+        let candidate = dir.join("helper/dlssnr_helper.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn dxvk_dll() -> Option<PathBuf> {
+    for dir in candidate_install_dirs() {
+        let candidate = dir.join("dxvk/vulkan-1.dll");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}

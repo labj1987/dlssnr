@@ -1,0 +1,13 @@
+[package]
+name = "dlssnr-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared-memory wire format between the dlssnr layer, helper, GUI and CLI"
+
+[lib]
+name = "dlssnr_protocol"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

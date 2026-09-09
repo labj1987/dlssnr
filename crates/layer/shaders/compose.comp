@@ -1,0 +1,164 @@
+#version 450
+// The composition pass: blends the model's answer onto the frame.
+//
+// A hand-translated GLSL expression of crates/layer/src/composition/color.rs's
+// `upgrade_tone_map`/`gamut_compress_reversible` -- kept in sync by hand (GLSL and
+// Rust can't literally share source); that Rust module's doc comment explains where
+// the algorithm itself comes from and why it's clean to implement independently. This
+// file is not yet wired into a live compute dispatch (see the layer crate's
+// CLAUDE.md entry) -- `crates/layer/src/composition/color.rs`'s `#[test]`s are what's
+// actually been verified so far; this is the shader that same math translates to.
+//
+// Bindings match the transport this pass reads/writes: the original frame (capture),
+// the proxy the model was shown, the model's raw answer, and the composed output.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D u_original;
+layout(binding = 1, rgba16f) uniform readonly image2D u_proxy;
+layout(binding = 2, rgba16f) uniform readonly image2D u_model_answer;
+layout(binding = 3, rgba16f) uniform writeonly image2D u_output;
+
+layout(push_constant) uniform Params {
+  float colour_strength;   // 0 = luminance-only, 1 = fully hue-corrected
+  float transfer_strength; // 0 = original frame untouched, 1 = full transfer
+  float max_ratio;         // clamp on the rescale ratio (near-black proxy guard)
+} params;
+
+float Luminance(vec3 rgb) {
+  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Bjorn Ottosson's published OkLab matrices (bottosson.github.io/posts/oklab/),
+// identical to what crates/layer/src/composition/color.rs uses (see that file for
+// why these specifically are not RenoDX's own work despite being cross-checked
+// against RenoDX's MIT-licensed oklab.hlsl).
+const mat3 LINEAR_SRGB_TO_OKLAB_LMS = mat3(
+    0.4122214708, 0.2119034982, 0.0883024619,
+    0.5363325363, 0.6806995451, 0.2817188376,
+    0.0514459929, 0.1073969566, 0.6299787005);
+const mat3 OKLAB_LMS_TO_OKLAB = mat3(
+    0.2104542553, 1.9779984951, 0.0259040371,
+    0.7936177850, -2.4285922050, 0.7827717662,
+    -0.0040720468, 0.4505937099, -0.8086757660);
+const mat3 OKLAB_TO_OKLAB_LMS = mat3(
+    1.0, 1.0, 1.0,
+    0.3963377774, -0.1055613458, -0.0894841775,
+    0.2158037573, -0.0638541728, -1.2914855480);
+const mat3 OKLAB_LMS_TO_LINEAR_SRGB = mat3(
+    4.0767416621, -1.2684380046, -0.0041960863,
+    -3.3077115913, 2.6097574011, -0.7034186147,
+    0.2309699292, -0.3413193965, 1.7076147010);
+
+vec3 OklabFromLinearSrgb(vec3 rgb) {
+  vec3 lms = LINEAR_SRGB_TO_OKLAB_LMS * rgb;
+  return OKLAB_LMS_TO_OKLAB * sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));
+}
+
+vec3 LinearSrgbFromOklab(vec3 oklab) {
+  vec3 lms = OKLAB_TO_OKLAB_LMS * oklab;
+  return OKLAB_LMS_TO_LINEAR_SRGB * (lms * lms * lms);
+}
+
+// Standard sRGB-linear<->XYZ (D65) and Hunt-Pointer-Estevez XYZ->LMS -- see the Rust
+// module doc comment; textbook color science, not RenoDX's or anyone's in particular.
+const mat3 LINEAR_SRGB_TO_XYZ = mat3(
+    0.4124564, 0.2126729, 0.0193339,
+    0.3575761, 0.7151522, 0.1191920,
+    0.1804375, 0.0721750, 0.9503041);
+const mat3 XYZ_TO_LINEAR_SRGB = mat3(
+    3.2404542, -0.9692660, 0.0556434,
+    -1.5371385, 1.8760108, -0.2040259,
+    -0.4985314, 0.0415560, 1.0572252);
+const mat3 XYZ_TO_HPE_LMS = mat3(
+    0.38971, -0.22981, 0.0,
+    0.68898, 1.18340, 0.0,
+    -0.07868, 0.04641, 1.0);
+const mat3 HPE_LMS_TO_XYZ = mat3(
+    1.9102329169, 0.3709500882, 0.0,
+    -1.1121299780, 0.6290542715, 0.0,
+    0.2019182498, 0.0, 1.0);
+const vec3 D65_WHITE_XYZ = vec3(0.95047, 1.0, 1.08883);
+
+vec3 UpgradeToneMap(vec3 original, vec3 proxy, vec3 model, float colour_strength) {
+  float original_luminance = Luminance(original);
+  float proxy_luminance = max(Luminance(proxy), 1e-6);
+  float model_luminance = max(Luminance(model), 1e-6);
+
+  // Below the proxy's own luminance, the original is already representable and is
+  // the target outright. Above it, the proxy clipped highlights the original had;
+  // hand that clipped difference back on top of the model's answer.
+  float target_luminance = original_luminance <= proxy_luminance
+      ? original_luminance
+      : model_luminance + (original_luminance - proxy_luminance);
+
+  float ratio = target_luminance / model_luminance;
+  vec3 rescaled = model * ratio;
+
+  float original_ratio = target_luminance / max(original_luminance, 1e-6);
+  vec3 luminance_only = original * original_ratio;
+
+  if (colour_strength <= 0.0) {
+    return luminance_only;
+  }
+
+  vec3 model_oklab = OklabFromLinearSrgb(model);
+  float model_chroma = length(model_oklab.yz);
+  vec2 chroma_dir = model_chroma > 1e-6 ? (model_oklab.yz / model_chroma) : vec2(0.0);
+
+  vec3 rescaled_oklab = OklabFromLinearSrgb(rescaled);
+  float rescaled_chroma = length(rescaled_oklab.yz);
+
+  vec3 corrected_oklab = vec3(rescaled_oklab.x, chroma_dir * rescaled_chroma);
+  vec3 fully_upgraded = LinearSrgbFromOklab(corrected_oklab);
+
+  return mix(luminance_only, fully_upgraded, clamp(colour_strength, 0.0, 1.0));
+}
+
+vec3 GamutCompressReversible(vec3 rgb) {
+  vec3 lms = XYZ_TO_HPE_LMS * (LINEAR_SRGB_TO_XYZ * rgb);
+  float y = Luminance(rgb);
+  vec3 neutral_lms = XYZ_TO_HPE_LMS * (D65_WHITE_XYZ * y);
+
+  float t_max = 1.0;
+  for (int c = 0; c < 3; ++c) {
+    if (lms[c] < 0.0) {
+      float delta = lms[c] - neutral_lms[c];
+      if (delta < 0.0) {
+        float t_candidate = neutral_lms[c] / (neutral_lms[c] - lms[c]);
+        t_max = min(t_max, max(t_candidate, 0.0));
+      }
+    }
+  }
+
+  if (t_max >= 1.0) {
+    return rgb;
+  }
+  vec3 compressed_lms = neutral_lms + (lms - neutral_lms) * t_max;
+  return XYZ_TO_LINEAR_SRGB * (HPE_LMS_TO_XYZ * compressed_lms);
+}
+
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(u_output);
+  if (pixel.x >= size.x || pixel.y >= size.y) {
+    return;
+  }
+
+  vec3 original = imageLoad(u_original, pixel).rgb;
+  vec3 proxy = imageLoad(u_proxy, pixel).rgb;
+  vec3 model = imageLoad(u_model_answer, pixel).rgb;
+
+  vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
+  // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a
+  // near-black proxy pixel can't produce an unbounded multiply/divide (see
+  // dlssnr_protocol::ShmHeader::max_ratio_bits's doc comment).
+  vec3 safe_proxy = max(proxy, vec3(1e-4));
+  vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / params.max_ratio, params.max_ratio);
+  vec3 transferred = original * transfer_ratio;
+
+  vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
+  vec3 result = GamutCompressReversible(blended);
+
+  imageStore(u_output, pixel, vec4(result, 1.0));
+}
