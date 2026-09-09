@@ -267,26 +267,42 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
 fn create_feature_at(s: &mut NgxSnippet, width: u32, height: u32) -> bool {
     let Some(create_feature) = s.create_feature else { return false };
     let name = |n: &str| CString::new(n).unwrap();
-    // SAFETY: `s.params` was allocated and validated in `load_and_init` above.
-    unsafe {
-        abi::ngx_set_u32(s.params, name("DLSSNR.Width").as_ptr(), width);
-        abi::ngx_set_u32(s.params, name("DLSSNR.Height").as_ptr(), height);
-        abi::ngx_set_u32(s.params, name("DLSSNR.InputWidth").as_ptr(), width);
-        abi::ngx_set_u32(s.params, name("DLSSNR.InputHeight").as_ptr(), height);
-        abi::ngx_set_u32(s.params, name("DLSSNR.OutputWidth").as_ptr(), width);
-        abi::ngx_set_u32(s.params, name("DLSSNR.OutputHeight").as_ptr(), height);
-        abi::ngx_set_u32(s.params, name("DLSSNR.Upscaling").as_ptr(), 0);
-        abi::ngx_set_f32(s.params, name("DLSSNR.Scale").as_ptr(), 1.0);
-        abi::ngx_set_f32(s.params, name("DLSSNR.ScalingRatio").as_ptr(), 1.0);
-        abi::ngx_set_u32(s.params, name("Width").as_ptr(), width);
-        abi::ngx_set_u32(s.params, name("Height").as_ptr(), height);
-        abi::ngx_set_u32(s.params, name("CreationNodeMask").as_ptr(), 1);
-        abi::ngx_set_u32(s.params, name("VisibilityNodeMask").as_ptr(), 1);
-        let flags = abi::feature_flags::DO_SHARPENING | abi::feature_flags::AUTO_EXPOSURE;
-        abi::ngx_set_u32(s.params, name("Feature_Flags").as_ptr(), flags);
+    let params = s.params;
+    // Guarded like every other real call into the DLL below: `params`'s vtable is a
+    // hand-ported ABI shape for a feature this crate has never had real hardware/DLL to
+    // test against (see the module doc comment and CLAUDE.md's `ngx.rs` gotchas) --  if
+    // a slot is misaligned relative to what the real driver's `nvngx.dll`/
+    // `nvngx_dlssnr.dll` actually expects, calling through it faults, and an unguarded
+    // fault here takes the whole helper down with no log line at all rather than
+    // latching `disabled` the way every other DLL call in this file already does.
+    let ((), seh) = guarded(
+        || {
+            // SAFETY: `params` was allocated and validated in `load_and_init` above.
+            unsafe {
+                abi::ngx_set_u32(params, name("DLSSNR.Width").as_ptr(), width);
+                abi::ngx_set_u32(params, name("DLSSNR.Height").as_ptr(), height);
+                abi::ngx_set_u32(params, name("DLSSNR.InputWidth").as_ptr(), width);
+                abi::ngx_set_u32(params, name("DLSSNR.InputHeight").as_ptr(), height);
+                abi::ngx_set_u32(params, name("DLSSNR.OutputWidth").as_ptr(), width);
+                abi::ngx_set_u32(params, name("DLSSNR.OutputHeight").as_ptr(), height);
+                abi::ngx_set_u32(params, name("DLSSNR.Upscaling").as_ptr(), 0);
+                abi::ngx_set_f32(params, name("DLSSNR.Scale").as_ptr(), 1.0);
+                abi::ngx_set_f32(params, name("DLSSNR.ScalingRatio").as_ptr(), 1.0);
+                abi::ngx_set_u32(params, name("Width").as_ptr(), width);
+                abi::ngx_set_u32(params, name("Height").as_ptr(), height);
+                abi::ngx_set_u32(params, name("CreationNodeMask").as_ptr(), 1);
+                abi::ngx_set_u32(params, name("VisibilityNodeMask").as_ptr(), 1);
+                let flags = abi::feature_flags::DO_SHARPENING | abi::feature_flags::AUTO_EXPOSURE;
+                abi::ngx_set_u32(params, name("Feature_Flags").as_ptr(), flags);
+            }
+        },
+        (),
+    );
+    crate::log!("[ngx] set DLSSNR parameters seh={:#x}", seh);
+    if seh != 0 {
+        return false;
     }
 
-    let params = s.params;
     let ((result, handle), seh) = guarded(
         || {
             let mut handle: abi::NgxHandle = std::ptr::null_mut();
