@@ -19,18 +19,22 @@ isolate it, never disguise it), and the per-crate design.
 
 ## Current state
 
-Every crate has real code now (milestones 1-3 solid and real-tested; 4 partial — the
-math is tested, the GPU pipeline isn't wired up yet; 5 and 6 real and working, with the
-caveats below). Read each crate's own gotchas section before touching it — "compiles"
-and "the plan says this milestone is done" are not the same claim anywhere in this repo.
+Every crate has real code now (milestones 1-3 solid and real-tested; 4 phase A/B landed
+2026-09-09 against real hardware — capture/transport/NGX-evaluate genuinely run every
+frame now, but this project's own composition math still never reaches the presented
+frame, see the `composition` section below for exactly what that does and doesn't
+mean; 5 and 6 real and working, with the caveats below). Read each crate's own gotchas
+section before touching it — "compiles" and "the plan says this milestone is done" are
+not the same claim anywhere in this repo.
 
 `helper` loads `nvngx_dlssnr.dll`, installs the caller-identity spoof, initializes NGX,
 and creates Feature 18 (`ngx::load_and_init`) -- the path that actually exercises the
 spoof and the SEH guard, wrapped in `crates/helper/src/guard.rs`'s VEH+`setjmp`/
-`longjmp` mechanism. There is no per-frame `EvaluateFeature` loop yet: that needs bound
-Vulkan image resources, which arrive with milestone 4 (the same resources the
-composition pass reads/writes). **As of 2026-09-09 this is real-tested, not just
-compiled**: the cross-compile toolchain now exists on this dev machine (see below), and
+`longjmp` mechanism. **As of 2026-09-09 there is a real per-frame `EvaluateFeature`
+loop** (`crates/helper/src/frame.rs`, wired into `main.rs`) — see the `composition`
+section below for what it does, what it caught and fixed on real hardware, and what's
+still not proven end to end. As of the same date this is real-tested, not just
+compiled: the cross-compile toolchain now exists on this dev machine (see below), and
 three purpose-built examples (`examples/guard_test.rs`, `spoof_test.rs`,
 `spoof_install_test.rs`) run the SEH guard and the caller-identity spoof for real under
 Wine, plus the full `dlssnr_helper.exe` binary itself was run under Wine and its
@@ -40,16 +44,18 @@ way — an infinite-recursion stack overflow that `cargo check` structurally cou
 have found — see `helper` gotchas below.
 
 `layer` hooks `vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/`vkQueuePresentKHR` via
-Google's `vulkan_layer` crate and runs the real shared-memory round trip on present, but
-does **not** touch swapchain image contents yet — `queue_present_khr` always presents
-the original, unmodified frame. Real capture/compose, device-extension injection for
-the dma-buf transport, and the queue-family bookkeeping that capture needs are all
-milestone 4. Verified via `cargo test -p dlssnr-layer` (the SHM round-trip state
-machine, including a simulated echo-helper thread and the private-directory security
-check) and `scripts/smoke-test.sh` (a real `VkInstance`/`VkDevice` through the system
-Vulkan loader with the layer actually negotiated and inserted into the call chain —
-this is what caught and fixed a real bug: `DlssnrDeviceInfo::new` originally panicked
-on any device that didn't enable `VK_KHR_swapchain`, which would have crashed every
+Google's `vulkan_layer` crate and runs the real shared-memory round trip on present.
+**As of 2026-09-09 `queue_present_khr` really does capture the presented image and
+round-trip it** (`crates/layer/src/capture.rs`) — but still always writes the
+*original* captured bytes back, never the model's answer, so what actually reaches the
+screen is unchanged from milestone 2 even though the pipeline underneath it is real
+now. See the `composition` section below for the precise current state. Verified via
+`cargo test -p dlssnr-layer` (the SHM round-trip state machine, including a simulated
+echo-helper thread and the private-directory security check) and
+`scripts/smoke-test.sh` (a real `VkInstance`/`VkDevice` through the system Vulkan
+loader with the layer actually negotiated and inserted into the call chain — this is
+what caught and fixed a real bug: `DlssnrDeviceInfo::new` originally panicked on any
+device that didn't enable `VK_KHR_swapchain`, which would have crashed every
 compute-only Vulkan app the layer got loaded into).
 
 ## Workspace layout
@@ -62,6 +68,9 @@ crates/
   layer/      cdylib, x86_64-unknown-linux-gnu only. The Vulkan implicit layer.
   helper/     bin, x86_64-pc-windows-gnu only, runs under Wine/Proton. Never built or
               run natively on a Linux dev machine.
+  supervisor/ lib, x86_64-unknown-linux-gnu only. Config/paths/process-supervision
+              shared between `gui` and `cli` (extracted 2026-09-09) so both start/stop
+              the helper through the same code.
   gui/        bin, gtk4 + libadwaita, flat src/*.rs modules (same convention as
               GreenLight/KernelPop/SteamPunk).
   cli/        bin, the `dlssnr-cli` helper-manager (init/start/stop/status/doctor/
@@ -155,16 +164,17 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   tells the `vulkan_layer` framework to fall through to its own next-dispatch exactly as
   if this crate weren't there, which is always correct when we have nothing useful to do
   anyway (an app that never enabled the extension will also never call the function).
-- **`vulkan_layer`'s `DeviceInfo`/`InstanceInfo` traits don't hand a device hook access
-  to its owning `ash::Instance`.** `create_device_info` gets `Arc<ash::Device>` and
-  `vk::PFN_vkGetDeviceProcAddr` only — enough to resolve device/extension function
-  pointers directly (what `device::resolve()` does), but not enough to call an
-  instance-level function like `vkGetPhysicalDeviceProperties` from inside device-level
-  code. This is why device-extension injection and the inert-on-non-NVIDIA-device check
-  (both need `InstanceHooks::create_device`, which *does* get the physical device and
-  whatever the `InstanceInfo`/`InstanceHooks` implementor stored from
-  `create_instance_info`) are deferred to milestone 4 rather than solved here with a
-  workaround.
+- **`vulkan_layer`'s `DeviceInfo`/`InstanceInfo` traits don't hand `create_device_info`
+  a way to reach whatever `create_instance_info` returned for the owning instance —
+  worked around, not a blocker anymore.** `create_device_info` does get
+  `vk::PhysicalDevice` directly (it always did; an earlier version of this note
+  conflated that with the separate, real gap: no `ash::Instance` reference), but
+  needed one to query physical-device memory properties when `capture.rs` builds its
+  staging buffer. Fixed 2026-09-09 with `lib.rs`'s `static CURRENT_INSTANCE:
+  Mutex<Option<Arc<ash::Instance>>>` — `create_instance_info` stashes the instance
+  there, `create_device_info` reads it back. A documented "last one wins"
+  simplification (games overwhelmingly create exactly one `VkInstance`), same spirit
+  as `device::PRIMARY`'s one-swapchain-at-a-time assumption elsewhere in this crate.
 - **Testing an implicit-type layer via `VK_LAYER_PATH` needs `VK_INSTANCE_LAYERS` too.**
   `VK_LAYER_PATH`/`VK_ADD_LAYER_PATH` only add manifests to the *explicit*-layer search;
   an implicit-type manifest found there is not auto-enabled the way a real one dropped
@@ -246,50 +256,115 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   `GetModuleFileNameW` from `KERNEL32.dll` itself, so this needs no NVIDIA DLL at all)
   and confirms it finds a real, already-loader-resolved IAT slot — no NVIDIA DLL needed
   for this specific check.
-- **`ngx.rs` proves the call sequence through `CreateFeature(18)` only.**
-  `EvaluateFeature` needs real bound `DLSSNR.Color`/`Output`/`MVec` Vulkan resources
-  (upstream's `NgxSetResources`) to mean anything; wiring that up is milestone 4's job,
-  paired with the composition pass that owns those same resources. The 1x1 placeholder
-  size in `create_feature_at` exists only to exercise the create call chain (and
-  therefore the spoof and the guard) end to end -- it is not a real frame size and
-  nothing should try to make it one. This part is still genuinely untested end-to-end
-  (no real `nvngx_dlssnr.dll` available) — only the load/spoof-install/init plumbing
-  around it has been.
+- **As of 2026-09-09, `ngx.rs`/`frame.rs` really do call `EvaluateFeature` with real
+  bound `DLSSNR.Color`/`Output`/`MVec` Vulkan resources** — the note this used to carry
+  (`EvaluateFeature` needs real bound resources "which is milestone 4's job", a 1x1
+  `CreateFeature` placeholder) is stale; see the `composition` section below for what's
+  actually real now, what real hardware bugs it found and fixed (a driver-level hang,
+  zero device extensions enabled, an unguarded crash), and what's still not proven
+  (no legitimate `nvngx_dlssnr.dll` has ever been available to test against, so
+  `CreateFeature`'s return is still a clean rejection, not a success).
 - **`lib.rs` exists alongside `main.rs` specifically so `examples/` can exercise
   individual modules** (`guard`, `spoof`) directly without a full helper run — `main.rs`
   is now a thin binary wrapper around the `dlssnr_helper` library crate. Keep this
   split; it's what makes the Wine-based example tests above possible at all.
 
-## `composition` (milestone 4, partial — math tested, GPU pipeline not wired up)
+## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
+## capture/transport/NGX-evaluate now genuinely run every frame; our own composition
+## math still never gets applied to what's presented. Reviewed and this section
+## brought back in sync with the actual code on 2026-09-10.)
 
-- **`crates/layer/src/composition/color.rs` and `downscale.rs` are real, tested pure
-  Rust** (15 + 9 `#[test]`s covering OkLab/HPE-LMS round trips, the two-branch
-  luminance rule's both branches, hue preservation at `colour_strength=0`, gamut
-  compression being an exact identity when already in-gamut and luminance-preserving
-  when not, every resampling kernel's defining properties). Two of those tests caught
-  real mistakes *in the tests themselves*, not the implementation — worth reading
-  `catmull_rom_matches_known_closed_form_at_half_sample`'s comment and
-  `mitchell_netravali_default_is_deliberately_non_interpolating` before assuming a
-  filter that doesn't equal 1 at `x=0` is broken; Mitchell-Netravali's own
-  recommended default (B=1/3, C=1/3) is *supposed* to not interpolate exactly, trading
-  that for smoothness — that's the whole point of the two-parameter family.
-- **`crates/layer/shaders/compose.comp` is a hand-translated GLSL expression of that
-  same, already-tested Rust math — but it has never been compiled, dispatched, or
-  checked against the Rust reference it's supposed to match.** Neither `glslc` nor
-  `glslangValidator` is installed on this dev machine (`glslang-tools` is
-  apt-available, not installed); nothing has verified this file even parses as valid
-  GLSL, let alone produces the same numbers as `color.rs`. Before relying on it:
-  install `glslang-tools`, run `glslangValidator -S comp compose.comp` for a syntax
-  check, then (the real test) dispatch it against a handful of known
-  original/proxy/model triples and diff the GPU output against `color.rs`'s own
-  functions run on the same inputs on the CPU.
-- **Nothing calls this shader.** `queue_present_khr` in `crates/layer/src/device.rs`
-  still always presents the original, unmodified frame (milestone 2's scope, unchanged).
-  Wiring it in needs: a compute pipeline + descriptor sets bound to the transport's
-  three image regions, `shaderc`/build-time SPIR-V compilation (`build.rs`), the
-  queue-family bookkeeping and command pool `device.rs`'s module doc comment already
-  flags as deferred, and the device-extension injection for the dma-buf transport. All
-  of that is still open.
+**What changed since the "GPU pipeline not wired up" note this section used to open
+with**: that's no longer accurate. `queue_present_khr` now really does capture the
+presented image, round-trip it through the helper, and the helper now really does call
+NGX's `EvaluateFeature` against real bound Vulkan resources — all four commits
+(`afbb408`, `16bf02e`, `072ea07`, `13de5cd`, 2026-09-09 17:10–19:57) came from a
+session working directly against real hardware (RTX 5070, driver 615.71.09, machine
+`lordnikon`), diagnosing real failures with real tools (`gdb` against a hung driver
+call, `objdump`/`strings` against both the real `nvngx_dlssnr.dll` and a working
+reference implementation's own compiled helper — binary inspection only, never
+source, same "shape not expression" rule as everywhere else in this project). No new
+unit tests came with this — none of it is meaningfully unit-testable without a real
+GPU + a real, legitimately-signed NGX DLL (which this project still doesn't have, see
+below) — verification here is real execution and log/gdb output, not `#[test]`.
+
+- **`crates/layer/src/capture.rs`** (new, 439 lines): builds a per-device command
+  pool/fence/host-visible staging buffer, and on `queue_present_khr` really does
+  transition the about-to-be-presented image, copy it into the staging buffer, hand
+  those bytes to `ShmClient::write_proxy`, round-trip through the helper, and copy
+  something back into the image before the real present call. Fails open at every
+  step (any Vulkan call failing just skips capture for that frame, presenting
+  unmodified — never a reason to stop trying later frames).
+- **The write-back is still always the original frame, not the model's answer.** Stage
+  2 of `capture::run` copies `r.buffer` — which stage 1 filled with the *captured*
+  bytes and nothing since has overwritten — back into the image. The real answer comes
+  back too (`shm.read_answer`), but only into a 16-byte diagnostic probe
+  (`answer_probe`) that's logged and discarded, never into anything that reaches the
+  presented frame. So: the transport round-trips for real every frame now, but what
+  the player actually sees has not changed since milestone 2. Applying the real answer
+  (or, further out, the `compose.comp` blend of it) to the write-back buffer is the
+  next real step here, not yet done.
+- **`crates/helper/src/frame.rs`** (new, 516 lines) + `ngx.rs` changes: real
+  Color/Output/MVec Vulkan images, a real upload → `EvaluateFeature` → download
+  sequence, wired into `main.rs`'s per-frame loop (watches `seq_req`, calls
+  `ngx::ensure_feature` once a real size is known, evaluates, writes an answer back —
+  echoing the proxy straight through on any failure so the transport still completes).
+  MVec is always an all-zero image (no real `VK_NV_optical_flow` yet, an intentional,
+  documented stand-in for "no motion", not a bug). The `DLSSNR.Color`/`.Output`/
+  `.MVec` parameter names binding these images are **guessed** "for shape" the same
+  way every other `DLSSNR.*` scalar parameter name here already was — no spec exists
+  for a fictional feature's resource bindings either; a wrong guess fails via the SEH
+  guard, not a crash.
+- **Three real, hardware-diagnosed fixes landed alongside the above, each worth
+  knowing about on its own:**
+  - `v0.1.2` (`afbb408`/`16bf02e`): `create_feature_at()`'s parameter-setting calls
+    were outside `guarded()`, the only DLL-touching block in `ngx.rs` that was — a
+    real fault there silently killed the whole helper a couple seconds after a
+    successful `VULKAN_Init_Ext`, no log line, no crash dialog. Now guarded like
+    everything else.
+  - `CreateFeature(18)` at a real size was hanging **indefinitely inside the NVIDIA
+    driver itself** (`libnvidia-glcore.so`, confirmed with `gdb`), traced to passing
+    `vk::CommandBuffer::null()` — the real API expects a live, currently-recording
+    command buffer it records GPU-side setup work into, which the caller then
+    ends/submits/fence-waits. Fixed in `create_feature_at` with a real
+    pool/buffer/begin/end/submit/fence-wait around the call.
+  - The helper's Vulkan device previously enabled **zero** device extensions.
+    Comparing against a real, working reference implementation's own compiled helper
+    (`strings`/`objdump` on the binary, confirmed present via
+    `vkEnumerateDeviceExtensionProperties` before requesting) turned up a
+    `WANTED_DEVICE_EXTENSIONS` list (`VK_EXT_external_memory_dma_buf`,
+    `VK_KHR_buffer_device_address`, `VK_NVX_binary_import`, `VK_NVX_image_view_handle`,
+    `VK_NV_optical_flow`, others) now requested when actually available — the leading
+    suspect for why `CreateFeature` behaved inconsistently even after every other fix.
+  - Also added, still experimental/diagnostic-only (logged, not gated on):
+    `NVSDK_NGX_VULKAN_GetFeatureRequirements` (a real export nothing here had ever
+    called before `CreateFeature`, which real NGX integrations call first) and a
+    parameter round-trip self-test (`DLSSNR.SelfTestProbe`, set then read back through
+    the same vtable `create_feature_at` uses, purely to confirm the plumbing works).
+  - Self-correction worth knowing about: an earlier pass of this same work added
+    `DLSSNR.Output.Width`/`.Height` parameters based on a mismatched third-party
+    reference; confirmed absent from the real DLL's own string table and removed
+    before landing.
+- **`crates/layer/src/composition/color.rs` and `downscale.rs` are still real, tested,
+  pure Rust and unchanged by any of this** (15 + 9 `#[test]`s — see git history for
+  what they cover). **`crates/layer/shaders/compose.comp` is still never compiled,
+  dispatched, or checked against that Rust reference, and nothing calls it.** This
+  milestone's phase A/B was about proving the capture/transport/NGX-evaluate pipeline
+  end to end, not about wiring in this project's own composition math — that's still
+  entirely separate, still-open work, unaffected by anything above.
+- **Not wired into device teardown**: `capture::destroy` exists (frees the command
+  pool/staging buffer/memory) but nothing calls it — no `destroy_device` hook exists
+  on `DlssnrDeviceInfo` at all yet. Real but minor (the OS/driver reclaims GPU
+  resources on process exit regardless); flagged here as a genuine gap, not fixed as
+  part of this review pass since it wasn't the thing being asked about.
+- **Still no legitimate `nvngx_dlssnr.dll` on hand anywhere** (see the earlier session
+  transcript: the copies found were either the wrong model entirely or a
+  signature-invalid, hash-mismatched file from an unofficial source, declined for use)
+  — so none of the above has ever been confirmed against a real, working model
+  evaluation; `CreateFeature`'s return code on `lordnikon` is still a rejection, just
+  now a fast, clean one instead of a driver-level hang. That is real, measurable
+  progress (a hang is strictly worse than a clean rejection), not proof the integration
+  is fully correct.
 
 ## `gui` (milestone 5, real — settings read/render correctly; write-back visually
 ## unconfirmed for an environment reason, not a code one)
