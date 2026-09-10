@@ -82,7 +82,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "dlssnr-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-gui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-helper"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ash",
  "dlssnr-protocol",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-layer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ash",
  "dlssnr-protocol",
@@ -123,14 +123,14 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dlssnr-supervisor"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dlssnr-protocol",
  "libc",

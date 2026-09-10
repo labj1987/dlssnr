@@ -27,6 +27,12 @@ mean; 5 and 6 real and working, with the caveats below). Read each crate's own g
 section before touching it — "compiles" and "the plan says this milestone is done" are
 not the same claim anywhere in this repo.
 
+**2026-09-10: real, repeated `EvaluateFeature` success against a real, legitimately-
+signed `nvngx_dlssnr.dll`, for the first time this project's own code has ever achieved
+it** (previously only ever seen from upstream's C++ build) — see the "First confirmed
+neural-rendering success" section below for the full test and what it does/doesn't
+prove.
+
 `helper` loads `nvngx_dlssnr.dll`, installs the caller-identity spoof, initializes NGX,
 and creates Feature 18 (`ngx::load_and_init`) -- the path that actually exercises the
 spoof and the SEH guard, wrapped in `crates/helper/src/guard.rs`'s VEH+`setjmp`/
@@ -434,6 +440,60 @@ re-testing any of the already-ruled-out hypotheses**:
   either gets silently skipped with only a `WARNING` in `VK_LOADER_DEBUG=all` output,
   easy to mistake for "this layer works fine" when it was actually never loaded at all
   (this cost real time in this investigation itself).
+
+## First confirmed neural-rendering success (2026-09-10, `lordnikon`, real hardware)
+
+**With the crash fix above landed, this project's own `helper` + `layer` produced real,
+repeated, successful DLSS 5 Neural Rendering evaluations against a real,
+legitimately-signed `nvngx_dlssnr.dll` for the first time.** Everything before this was
+either simulated (unit tests), run against a bad/rejected DLL, or blocked outright by
+the implicit-activation crash — this is the first time the full real path has actually
+been exercised end to end with a model that can say yes.
+
+**What was run**: a fresh cross-compiled release `dlssnr_helper.exe`, launched directly
+under the real `Proton-CachyOS Latest` runner (bypassing `dlssnr-cli`/`dlssnr-gui`,
+neither of which is deployed to `lordnikon` yet — this called `dlssnr_supervisor::start`'s
+exact env var set by hand: `WINEPREFIX`/`STEAM_COMPAT_DATA_PATH` pointed at a fresh,
+throwaway prefix, `STEAM_COMPAT_CLIENT_INSTALL_PATH` at the real Steam install,
+`DLSSNR_BIN_DIR=Z:/home/alex/.local/share/dlssnr/binaries` at the real, hash-verified
+NGX binaries already on that machine, `PROTON_ENABLE_NVAPI=1`/`DLSSNR_SKIP_NVAPI=1` as
+`start()` itself sets), then real `vkcube` with `VK_LAYER_dlssnr_neural` activated the
+same real, implicit way the crash fix above was verified with. **Both sides were pointed
+at an isolated `DLSSNR_UID=rstest`** (`/tmp/dlssnr-rstest/`, not the real `/tmp/dlssnr-1000/`)
+specifically so this test could never collide with `lordnikon`'s own real, working
+upstream install, which happens to share this project's exact `~/.config/dlssnr`/
+`~/.local/share/dlssnr` paths by design (see `crates/supervisor/src/paths.rs` — this
+project deliberately mirrors upstream's own layout so it can be a drop-in alternative).
+
+**What the helper's real log showed, in order**:
+- `AllocateParameters -> 0x1`, `params round-trip self-test -> 0x1 ... readback=0x5a5a`
+  — the parameter-vtable plumbing works.
+- `VULKAN_Init_Ext -> 0x1` — NGX itself initializes cleanly against the real Vulkan
+  device this helper's own `frame.rs`/`ngx.rs` set up.
+- `GetFeatureRequirements -> 0xbad00005` — the diagnostic-only, not-gated-on call (see
+  the `composition` section below) still fails; harmless, exactly as already documented.
+- Once real frames started arriving from the layer: **`VULKAN_CreateFeature(18) -> 0x1
+  seh=0x0 handle=0x2b7ac00 size=1920x1080`** — a real, non-null feature handle, the
+  identical success shape previously only ever seen from upstream's own C++ build.
+- **`EvaluateFeature -> 0x1` on 243 of 244 captured frames** (the one `evaluated=false`
+  is frame 1, captured before `CreateFeature` had run yet — expected, not a failure).
+  Zero evaluation failures across the whole 10-second `vkcube` run.
+- The layer's own log agreed: `round trip answered=true` for every one of those frames.
+
+**What this does and does not prove**: this confirms the full real path — capture,
+SHM transport, `EvaluateFeature` with real bound Vulkan resources, the parameter
+plumbing, the caller-identity spoof, the SEH guard — genuinely works end to end against
+a real model on real hardware, repeatedly, not just once. It does **not** yet prove the
+*visual* result is correct (this test never looked at a frame; `compare_mode`/
+`debug_view` would be how to actually see the model's answer, and this project's own
+composition math still isn't wired into the write-back — see `composition` below,
+unchanged by this test) or that real optical flow is being fed in (`MVec` is still the
+all-zero stand-in, also unchanged by this test, so the model was evaluated with "no
+motion" input regardless of what `vkcube`'s own rotating cube was actually doing).
+**Genuinely closed by this test**: whether this project's own from-scratch Rust NGX
+integration can produce a real, successful, repeated model evaluation at all, on the
+first machine that's ever had a legitimate DLL to test it against. That question is now
+answered yes.
 
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the

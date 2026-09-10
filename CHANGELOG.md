@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.7 — 2026-09-10
+
+- **First confirmed real DLSS 5 Neural Rendering success from this project's own
+  code.** With the 0.1.6 crash fix in place, ran a fresh `dlssnr_helper.exe` under real
+  Proton + real `vkcube`/`VK_LAYER_dlssnr_neural` (implicit activation) against the
+  real, legitimately-signed `nvngx_dlssnr.dll` on `lordnikon`. Result: `VULKAN_CreateFeature(18)
+  -> 0x1` (real non-null handle, 1920x1080) and `EvaluateFeature -> 0x1` on 243/244
+  captured frames (the one miss is frame 1, before `CreateFeature` had run) — zero
+  evaluation failures across a full 10-second run. This is the exact success shape
+  previously only ever produced by upstream's C++ build. Doesn't yet prove the visual
+  output is correct (composition math still isn't wired in, real optical flow still
+  isn't) — see CLAUDE.md's new "First confirmed neural-rendering success" section for
+  exactly what this does and doesn't close.
+- Repo visibility changed to private.
+
 ## 0.1.6 — 2026-09-10
 
 - **Fixed the critical layer crash documented in 0.1.5**: `VK_LAYER_dlssnr_neural`
