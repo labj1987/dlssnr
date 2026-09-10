@@ -343,12 +343,16 @@ pub unsafe fn run(
     }
 
     // CPU side: the captured bytes are now in `r.ptr` (host-coherent, no explicit
-    // flush/invalidate needed). Hand them to the helper, then read back whatever
-    // answer is there. Phase A/B: nothing populates the answer region with anything
-    // meaningful yet (the helper's real per-frame NGX evaluate is a separate, still-
-    // landing piece -- see the milestone-4 plan) -- reading it is still real code, but
-    // the bytes actually written back into `image` below are the just-captured ones,
-    // so a not-yet-answering (or stub-echoing) helper never corrupts what's presented.
+    // flush/invalidate needed). Hand them to the helper, then, if it actually
+    // answered, overwrite `r.ptr` in place with that answer -- stage 2 below copies
+    // whatever is sitting in `r.ptr` back into `image`, so this is what makes the
+    // helper's answer (a real NGX evaluation, or the helper's own proxy-echo fallback
+    // when the model isn't ready -- `dlssnr_helper::main`'s per-frame loop guarantees
+    // the answer region is always the same size/format as the proxy either way)
+    // actually reach the screen. A helper that never answers (not running, or the
+    // round trip timed out) leaves `r.ptr` untouched -- it still holds the bytes
+    // stage 1 just captured, so stage 2 below presents those unmodified, same fail-open
+    // behavior as every other error path in this function.
     // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (the memory
     // type/size `ensure` just built or confirmed already satisfies this call's own
     // `frame_bytes`).
@@ -356,19 +360,16 @@ pub unsafe fn run(
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
     let answered = shm.try_round_trip();
-    let mut answer_probe = [0u8; 16];
-    let answer_bytes = shm.read_answer(&mut answer_probe);
-    crate::log!(
-        "[capture] {}x{} {} bytes -> proxy; round trip answered={} answer[0..{}]={:?}",
-        width,
-        height,
-        frame_bytes,
-        answered,
-        answer_bytes,
-        &answer_probe[..answer_bytes]
-    );
+    if answered {
+        // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
+        // writes past the slice's length, which is exactly `frame_bytes` here.
+        let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
+        shm.read_answer(answer_dst);
+    }
+    crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
 
-    // Stage 2: staging buffer (still holding the captured bytes) -> image.
+    // Stage 2: staging buffer (now holding the answer, if there was one -- otherwise
+    // still the captured bytes) -> image.
     // SAFETY: `r.cmd` was ended above; the pool it came from allows re-recording.
     if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
         return false;
@@ -379,9 +380,9 @@ pub unsafe fn run(
     }
     let copy_in = copy_out;
     // SAFETY: `image` is currently `TRANSFER_DST_OPTIMAL` from stage 1's own final
-    // barrier; `r.buffer` still holds the bytes stage 1 copied out (untouched by the
-    // CPU-side round trip above, which only read from it and wrote to the shared
-    // mapping, never back into `r.buffer`).
+    // barrier; `r.buffer` (same host-coherent memory as `r.ptr`, which the CPU-side
+    // block above may have just overwritten with the answer) holds exactly
+    // `frame_bytes` valid bytes either way, matching `copy_in`'s own extent.
     unsafe {
         device.cmd_copy_buffer_to_image(r.cmd, r.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_in]);
     }

@@ -46,10 +46,11 @@ have found — see `helper` gotchas below.
 `layer` hooks `vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/`vkQueuePresentKHR` via
 Google's `vulkan_layer` crate and runs the real shared-memory round trip on present.
 **As of 2026-09-09 `queue_present_khr` really does capture the presented image and
-round-trip it** (`crates/layer/src/capture.rs`) — but still always writes the
-*original* captured bytes back, never the model's answer, so what actually reaches the
-screen is unchanged from milestone 2 even though the pipeline underneath it is real
-now. See the `composition` section below for the precise current state. Verified via
+round-trip it** (`crates/layer/src/capture.rs`), and **as of 2026-09-10 the write-back
+actually uses the helper's answer** instead of always re-presenting the untouched
+capture — see the `composition` section below for exactly what that fix does and its
+one real caveat (not yet verified against a real present cycle; this sandbox has no
+display/swapchain to drive one through). Verified via
 `cargo test -p dlssnr-layer` (the SHM round-trip state machine, including a simulated
 echo-helper thread and the private-directory security check) and
 `scripts/smoke-test.sh` (a real `VkInstance`/`VkDevice` through the system Vulkan
@@ -270,9 +271,10 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   split; it's what makes the Wine-based example tests above possible at all.
 
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
-## capture/transport/NGX-evaluate now genuinely run every frame; our own composition
-## math still never gets applied to what's presented. Reviewed and this section
-## brought back in sync with the actual code on 2026-09-10.)
+## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
+## helper's answer actually reaches the write-back too, not yet verified against a
+## real present cycle; this project's own composition math still never gets applied.
+## Reviewed and this section brought back in sync with the actual code on 2026-09-10.)
 
 **What changed since the "GPU pipeline not wired up" note this section used to open
 with**: that's no longer accurate. `queue_present_khr` now really does capture the
@@ -295,15 +297,25 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   something back into the image before the real present call. Fails open at every
   step (any Vulkan call failing just skips capture for that frame, presenting
   unmodified — never a reason to stop trying later frames).
-- **The write-back is still always the original frame, not the model's answer.** Stage
-  2 of `capture::run` copies `r.buffer` — which stage 1 filled with the *captured*
-  bytes and nothing since has overwritten — back into the image. The real answer comes
-  back too (`shm.read_answer`), but only into a 16-byte diagnostic probe
-  (`answer_probe`) that's logged and discarded, never into anything that reaches the
-  presented frame. So: the transport round-trips for real every frame now, but what
-  the player actually sees has not changed since milestone 2. Applying the real answer
-  (or, further out, the `compose.comp` blend of it) to the write-back buffer is the
-  next real step here, not yet done.
+- **Fixed 2026-09-10: the write-back now actually uses the helper's answer.** Until
+  then, stage 2 of `capture::run` always copied `r.buffer` — which stage 1 filled with
+  the *captured* bytes and nothing since had overwritten — back into the image; the
+  real answer came back too (`shm.read_answer`) but only into a 16-byte diagnostic
+  probe that got logged and discarded. Now, when the round trip answers, `r.ptr` (the
+  same host-coherent memory `r.buffer` is bound to) gets overwritten in place with the
+  full answer before stage 2's copy runs; a helper that never answers still leaves
+  `r.ptr` holding the just-captured bytes, so the existing fail-open behavior is
+  unchanged. **Still not verified end to end against a real present cycle** — this
+  sandbox has no real display/swapchain to drive `queue_present_khr` through (the
+  existing smoke test only creates a bare device, never a swapchain), and the other
+  session's real-hardware testing on `lordnikon` predates this specific change.
+  Reasoned through carefully (the SAFETY comments spell out exactly why re-reading
+  `r.ptr`/`r.buffer` after the CPU-side overwrite is sound) and the full test suite
+  stays green, but the next real verification of this path should happen on
+  `lordnikon` against an actual game, not just asserted correct from here. Once this
+  is confirmed working, `compose.comp`'s blend is the next, still fully separate,
+  still-unstarted step — applying the model's raw answer directly (what this fix does)
+  and blending it via this project's own composition math are two different things.
 - **`crates/helper/src/frame.rs`** (new, 516 lines) + `ngx.rs` changes: real
   Color/Output/MVec Vulkan images, a real upload → `EvaluateFeature` → download
   sequence, wired into `main.rs`'s per-frame loop (watches `seq_req`, calls

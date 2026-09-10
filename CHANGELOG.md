@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-09-10
+
+- The write-back now uses the helper's actual answer instead of always
+  re-presenting the untouched capture. Not yet verified against a real present
+  cycle (no display/swapchain in this dev sandbox) — the underlying change is
+  small and carefully reasoned through, but real confirmation still needs to
+  happen against an actual game on real hardware.
+
 ## 0.1.3 — 2026-09-10
 
 - Settings changed in the GUI now survive a reboot. Previously they lived only in the
