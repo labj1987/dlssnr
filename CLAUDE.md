@@ -714,11 +714,22 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   milestone's phase A/B was about proving the capture/transport/NGX-evaluate pipeline
   end to end, not about wiring in this project's own composition math — that's still
   entirely separate, still-open work, unaffected by anything above.
-- **Not wired into device teardown**: `capture::destroy` exists (frees the command
-  pool/staging buffer/memory) but nothing calls it — no `destroy_device` hook exists
-  on `DlssnrDeviceInfo` at all yet. Real but minor (the OS/driver reclaims GPU
-  resources on process exit regardless); flagged here as a genuine gap, not fixed as
-  part of this review pass since it wasn't the thing being asked about.
+- **Not wired into device teardown, and checked (2026-09-10) that this isn't a quick
+  fix**: `capture::destroy` exists (frees the command pool/staging buffer/memory) but
+  nothing calls it. Looked into wiring it in properly this session: the pinned
+  `vulkan-layer` commit's `DeviceHooks` trait has **no interceptable `destroy_device`
+  command at all** (confirmed by reading its generated trait definition), and its
+  framework-level `Global::destroy_device` calls the *real* `vkDestroyDevice` on the
+  next layer/driver **before** dropping our `DeviceInfoContainer` -- so a naive
+  `impl Drop for DlssnrDeviceInfo` that called `capture::destroy` there would be
+  issuing Vulkan calls (`vkDestroyFence`/`vkFreeMemory`/etc.) against an
+  **already-destroyed** `VkDevice`, which is genuine undefined behavior, not a fix.
+  There is no safe hook point in this pinned crate version to run cleanup before real
+  device destruction; doing this properly would mean patching/forking the git
+  dependency to add one, a real but separate undertaking. Real but minor as a leak (the
+  OS/driver reclaims GPU resources on process exit regardless) — left as a genuine,
+  now-better-understood gap rather than a quick fix that would trade a harmless leak
+  for real UB.
 - **Still no legitimate `nvngx_dlssnr.dll` on hand anywhere** (see the earlier session
   transcript: the copies found were either the wrong model entirely or a
   signature-invalid, hash-mismatched file from an unofficial source, declined for use)
