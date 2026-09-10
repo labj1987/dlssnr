@@ -672,12 +672,10 @@ for the CPU path and 244 for no composition at all. The shader itself almost cer
 runs in microseconds on real hardware; the modest gain points at the *synchronous,
 one-submit-one-wait-per-frame* dispatch pattern (`GpuCompose::dispatch` blocks on a
 fence every single call, the same discipline `capture.rs`'s own two transfer stages
-already use) as the real remaining cost -- three separate CPU-GPU round trips now
-happen per frame (capture's own two stages plus this one), each paying real
+already use) as the real remaining cost -- three separate CPU-GPU round trips per
+frame at this point (capture's own two stages plus this one), each paying real
 kernel/driver synchronization overhead regardless of how fast the GPU work inside it
-is. Pipelining/double-buffering across these stages to avoid blocking every frame is
-real, scoped, **still-open** work -- not done by this change, and now the actual
-next lever for real playable framerates, more than the compute shader itself.
+is.
 
 **Verified**: the 2 new `#[cfg(test)]`s above (`gpu_dispatch_matches_the_cpu_reference`,
 `gpu_dispatch_handles_a_resize` -- the latter confirms `ensure_sized`'s rebuild-on-
@@ -685,6 +683,56 @@ resize path, not just its happy path, works against a real device too) plus the 
 existing suite (27 tests in this crate alone) still green. Both skip gracefully
 (logging why, not failing) in an environment with no Vulkan loader/ICD at all, rather
 than breaking a build that has no way to run them.
+
+## Merged GPU compose + write-back into one submission (2026-09-10) -- real but
+## smaller-than-hoped further gain, and what it reveals about the *actual* remaining cost
+
+**`GpuCompose::dispatch_into_image` (new)**, tried first in `capture.rs`'s write-back
+whenever nothing on the CPU needs to see the composited bytes afterward (i.e. no
+`capture_request` dump is pending -- checked via a new non-consuming
+`ShmClient::capture_request_pending`, since [`take_capture_request`](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along-the-way-plus-one-important-false-alarm-2026-09-10-lordnikon)
+would wrongly consume a real request just to decide routing). Instead of downloading
+the compute shader's answer to a CPU slice and having `capture.rs` upload it again in
+a separate stage-2 submission, this writes the result straight into the real swapchain
+image, in the *same* command buffer as the compute dispatch itself -- two GPU
+submissions per frame instead of three, and no CPU round trip for the composited bytes
+at all in the common case. **Deliberately still buffer-mediated, not a raw
+`vkCmdCopyImage` from the compute output image straight into the swapchain image**:
+that would be a byte-for-byte copy with no channel-swizzle, silently corrupting colors
+the moment a real swapchain's format differs from this module's own hardcoded
+`R8G8B8A8_UNORM` (e.g. a common `B8G8R8A8` swapchain) -- something this project has no
+practical way to vary and test across in this environment. A buffer has no format
+attached at all, so copying through one and letting the final `vkCmdCopyBufferToImage`
+target the real image's own true format (exactly what `capture.rs`'s existing stage 2
+already relied on) is correct regardless of what that real format turns out to be.
+Verified byte-for-byte identical to the already-verified `dispatch` path by a new real
+local test (`dispatch_into_image_matches_dispatch`) before ever touching real hardware,
+same "test on lavapipe first" discipline as the shader-bug fix above.
+
+**Verified correct and measured on real hardware**: every frame in a real `vkcube` run
+took this fast path (`composed_directly=true` in the layer's own log) except the one
+frame a real `capture_request` was pending for, which correctly fell back to the
+slower, CPU-visible path -- confirmed via a real dump, still visually correct. Real
+performance gain: **128 frames in the same 10-second run, up from 118** -- a real,
+modest ~8% further improvement, smaller than the reduced submission count alone might
+suggest.
+
+**What this reveals**: the no-composition baseline (244 frames/10s) *also* does exactly
+two GPU submissions per frame (capture's own stage 1 and stage 2 always run, whether or
+not anything modifies the bytes in between) -- so submission *count* was never actually
+the dominant remaining difference once this change made the composed path's count match
+it. The real, larger remaining gap (244 vs. 128) is much more likely genuine GPU
+bandwidth/work-volume: the composed path moves several times as many bytes through
+VRAM/PCIe per frame (three extra images uploaded/downloaded around the compute
+dispatch, on top of the capture round trip every path already pays) and runs a real
+compute dispatch on top, not just synchronization overhead a smarter submission
+strategy could hide. Genuinely closing that gap further would mean cross-*frame*
+pipelining (submit frame N's GPU work without blocking, only wait on frame N-1's
+before reusing its resources) -- a real architecture change that trades in a frame of
+added latency between capture and presentation, a real product tradeoff, not just an
+implementation detail, and **deliberately not attempted in this pass**: it needs a
+human, informed decision about whether that latency is acceptable, not a unilateral
+one.
 
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the

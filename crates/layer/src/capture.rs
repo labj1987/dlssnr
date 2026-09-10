@@ -367,6 +367,14 @@ pub unsafe fn run(
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
     let answered = shm.try_round_trip();
+    // `true` only when `composition::gpu::GpuCompose::dispatch_into_image` already
+    // wrote the fully composited result straight into `image` (and restored its
+    // `PRESENT_SRC_KHR` layout) itself -- skips the capture_request dump (nothing
+    // useful to dump: `r.ptr` still holds the *raw* answer, not the composited
+    // result, on this path) and stage 2 (there is nothing left for it to do) below,
+    // returning early instead. See `dispatch_into_image`'s own doc comment for why
+    // this is worth a whole separate path rather than just "one fewer copy".
+    let mut composed_directly = false;
     if answered {
         // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
         // writes past the slice's length, which is exactly `frame_bytes` here.
@@ -390,23 +398,49 @@ pub unsafe fn run(
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
-                        if let Some(gpu) = gpu_compose {
-                            composed = gpu.dispatch(
-                                device,
-                                instance,
-                                physical_device,
-                                queue,
-                                width,
-                                height,
-                                &original,
-                                answer_dst,
-                                settings.colour_strength,
-                                settings.transfer_strength,
-                                settings.max_ratio,
-                            );
+                        // Try the fast, no-CPU-round-trip path first -- but only when
+                        // nothing on the CPU needs to see the result afterward. A
+                        // pending `capture_request` does (its dump needs real bytes
+                        // in `r.ptr`), so that specific, rare, deliberately-triggered
+                        // case still goes through the slower CPU-visible `dispatch`
+                        // below, same as before this path existed.
+                        if !shm.capture_request_pending() {
+                            if let Some(gpu) = gpu_compose {
+                                composed_directly = gpu.dispatch_into_image(
+                                    device,
+                                    instance,
+                                    physical_device,
+                                    queue,
+                                    width,
+                                    height,
+                                    &original,
+                                    answer_dst,
+                                    settings.colour_strength,
+                                    settings.transfer_strength,
+                                    settings.max_ratio,
+                                    image,
+                                );
+                            }
+                        }
+                        if !composed_directly {
+                            if let Some(gpu) = gpu_compose {
+                                composed = gpu.dispatch(
+                                    device,
+                                    instance,
+                                    physical_device,
+                                    queue,
+                                    width,
+                                    height,
+                                    &original,
+                                    answer_dst,
+                                    settings.colour_strength,
+                                    settings.transfer_strength,
+                                    settings.max_ratio,
+                                );
+                            }
                         }
                     }
-                    if !composed {
+                    if !composed_directly && !composed {
                         crate::composition::apply::apply_rgba8(
                             &original,
                             answer_dst,
@@ -424,7 +458,20 @@ pub unsafe fn run(
             }
         }
     }
-    crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
+    crate::log!(
+        "[capture] {}x{} {} bytes -> proxy; round trip answered={} composed_directly={}",
+        width,
+        height,
+        frame_bytes,
+        answered,
+        composed_directly
+    );
+    if composed_directly {
+        // `image` is already fully written and back in `PRESENT_SRC_KHR` --
+        // `dispatch_into_image` did stage 2's whole job itself, in the same
+        // submission as the compute dispatch. Nothing left to do this frame.
+        return true;
+    }
 
     // Real `ShmHeader::capture_request` support: dump this frame's original and
     // final (post-composition, if any ran above) bytes to disk. Checked regardless of

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.13 — 2026-09-10
+
+- **Merged GPU compose + write-back into one submission** (`GpuCompose::dispatch_into_image`,
+  new): writes the composited result straight into the real swapchain image, in the
+  same command buffer as the compute dispatch, when nothing needs to see the bytes on
+  the CPU (no pending `capture_request` dump — checked via a new non-consuming
+  `ShmClient::capture_request_pending`). Two GPU submissions per frame instead of
+  three, no CPU round-trip for the composited bytes in the common case. Deliberately
+  routes through an intermediate buffer rather than a raw image-to-image copy, since
+  the latter would silently corrupt colors if a real swapchain's format ever differs
+  from this module's own hardcoded format (nothing here can vary/test that in this
+  environment) — a buffer has no format attached, so the final copy always targets the
+  real image's own true format, exactly like the existing stage 2 it replaces.
+- Verified byte-for-byte identical to the already-verified separate-dispatch path by a
+  new local test, before ever touching real hardware. Verified correct and measured on
+  real hardware after: every frame took the fast path except the one a real
+  `capture_request` was pending for, which correctly fell back and still dumped a
+  visually correct frame. Real gain: 128 frames/10s, up from 118.
+- Documented what this reveals: the no-composition baseline already does the same
+  number of submissions per frame, so the larger remaining gap (244 vs. 128) is real
+  GPU bandwidth/work-volume, not submission count — genuinely closing it further needs
+  cross-frame pipelining, which trades in a frame of latency and is a real product
+  decision, not attempted here.
+- 1 new test, full suite green.
+
 ## 0.1.12 — 2026-09-10
 
 - **`shaders/compose.comp` is now really dispatched on the GPU** (`crates/layer/src/composition/gpu.rs`,

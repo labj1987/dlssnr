@@ -102,6 +102,16 @@ impl ShmClient {
         hdr.capture_request.swap(0, Ordering::Relaxed) != 0
     }
 
+    /// Non-consuming version of [`Self::take_capture_request`] -- lets a caller decide
+    /// *how* to produce this frame's composited bytes (a fast, GPU-only path with no
+    /// CPU-visible result, vs. a path that leaves the result somewhere
+    /// [`Self::take_capture_request`]'s caller can dump) before committing to either,
+    /// without losing/duplicating the actual one-shot request in the process.
+    pub fn capture_request_pending(&self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        hdr.capture_request.load(Ordering::Relaxed) != 0
+    }
+
     /// The settings `composition::apply::apply_rgba8` needs, read fresh every frame
     /// (each is a single atomic load) so a live GUI change takes effect on the very
     /// next present rather than needing a restart. `None` before the mapping is open.
