@@ -12,8 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mingw-w64 (for the Windows-only helper crate)
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      # Same package list build-appimage.sh installs on a from-scratch image --
+      # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
+      # real system libraries via pkg-config, not just a Rust toolchain), plus mingw
+      # for the Windows-only helper crate.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 
       - name: Install Rust
         run: rustup target add x86_64-pc-windows-gnu
