@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.15 — 2026-09-10
+
+- **Fixed a real, 100%-reproducible crash on every single helper start attempt**
+  with `runner_type = "proton"`: `dlssnr_supervisor::start()` never set
+  `STEAM_COMPAT_CLIENT_INSTALL_PATH`, which Proton's own launch script reads directly
+  out of the environment with no fallback (`KeyError` otherwise) during its own
+  prefix setup, before ever getting to run the helper .exe. Found running a real game
+  (GTA San Andreas – The Definitive Edition) on `lordnikon` — every manual SSH test
+  this project's own history has done set this by hand for exactly this reason, but
+  the fix never made it back into the actual production code path the GUI's "Start"
+  button and `dlssnr-cli start` both use. Added `dlssnr_supervisor::paths::steam_install_dir`
+  (checks the same native/Flatpak/Snap candidates `dlssnr-cli`'s own Proton discovery
+  already scans, picks the first that's a real directory) and wired it into `start()`.
+  2 new tests.
+- Also found (not a code bug, a real system-configuration conflict, not touched
+  without asking): a systemd `~/.config/environment.d/dlssnr.conf` — almost certainly
+  left behind by upstream's own installer — globally forces
+  `VK_INSTANCE_LAYERS=VK_LAYER_NV_dlssnr:...` for every Vulkan app in the session,
+  which very plausibly explains a real game showing this project's own layer as "not
+  attached" (upstream's real layer is what's actually active) and could itself cause a
+  real performance hit if both layers end up running their own separate neural
+  rendering pass on the same game simultaneously.
+
 ## 0.1.14 — 2026-09-10
 
 - **Cross-frame async pipelining** (`GpuCompose::dispatch_into_image_async`, new):

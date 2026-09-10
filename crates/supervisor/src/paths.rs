@@ -49,3 +49,71 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// The real Steam client install root (the directory containing `steamapps/`,
+/// `compatibilitytools.d/`, etc.) -- what `STEAM_COMPAT_CLIENT_INSTALL_PATH` needs to
+/// point at for Proton's own launch script to run at all (`start()`'s own doc comment
+/// explains why this has to be set). Same candidate list `dlssnr-cli`'s own Proton
+/// discovery (`runners.rs::candidate_dirs`) already scans for
+/// `compatibilitytools.d` -- this just checks the *parent* of each and returns the
+/// first that's a real directory, since a real Steam install is what actually creates
+/// these paths, in this same order of likelihood (native package first, then the
+/// sandboxed variants).
+pub fn steam_install_dir() -> Option<String> {
+    let xdg_data_home = xdg("XDG_DATA_HOME", ".local/share");
+    let home = home();
+    [
+        format!("{xdg_data_home}/Steam"),
+        format!("{home}/.var/app/com.valvesoftware.Steam/data/Steam"),
+        format!("{home}/snap/steam/common/.local/share/Steam"),
+    ]
+    .into_iter()
+    .find(|dir| std::path::Path::new(dir).is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real filesystem, real env var override -- confirms `steam_install_dir` actually
+    /// finds a directory that exists (not just "returns some string unconditionally"),
+    /// and returns `None` when nothing does. Found and fixed as a real bug 2026-09-10:
+    /// `start()` never set `STEAM_COMPAT_CLIENT_INSTALL_PATH` at all before this
+    /// existed, causing a real `KeyError` crash in Proton's own script on every single
+    /// start attempt with `runner_type = "proton"`.
+    #[test]
+    fn finds_a_real_steam_install_under_xdg_data_home() {
+        let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-{}", std::process::id()));
+        let steam_dir = scratch.join("Steam");
+        std::fs::create_dir_all(&steam_dir).unwrap();
+
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", &scratch);
+
+        let found = steam_install_dir();
+        assert_eq!(found.as_deref(), steam_dir.to_str());
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn returns_none_when_no_candidate_exists() {
+        let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-none-{}", std::process::id()));
+        // Deliberately do not create `scratch` itself -- every candidate under it is
+        // real-but-nonexistent, the case this function must fail open on.
+
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", &scratch);
+
+        assert_eq!(steam_install_dir(), None);
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+}

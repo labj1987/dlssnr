@@ -87,6 +87,17 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
         envs.push(("PROTON_ENABLE_NVAPI".to_string(), "1".to_string()));
         envs.push(("DLSSNR_SKIP_NVAPI".to_string(), "1".to_string()));
         envs.push(("STEAM_COMPAT_DATA_PATH".to_string(), paths::prefix_dir()));
+        // Proton's own launch script reads this directly out of the environment
+        // (`os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]`, no fallback) during
+        // prefix setup, before it ever gets to running the helper .exe -- omitting it
+        // is a real, confirmed `KeyError` crash on *every* start attempt, found
+        // 2026-09-10 running this against a real game session on `lordnikon`: the
+        // helper never got further than Proton's own setup_prefix() step. Every
+        // manual SSH test this project's own history has ever done set this by hand
+        // without that fix ever making it back into this function -- this is that fix.
+        if let Some(steam_dir) = paths::steam_install_dir() {
+            envs.push(("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), steam_dir));
+        }
         (cfg.runner_path.clone(), vec!["run".to_string(), helper.display().to_string()])
     } else {
         (cfg.runner_path.clone(), vec![helper.display().to_string()])

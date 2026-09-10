@@ -813,6 +813,61 @@ synchronization tweak.
 `dispatch_into_image_matches_dispatch` still passing against the now-refactored
 `ComposeSlot`-based internals) — 30 tests in this crate now, full workspace suite green.
 
+## First real-game session, and a real production crash that everyone's own testing
+## had been silently working around for a while (2026-09-10, `lordnikon`)
+
+Alex ran a real, actual game (GTA San Andreas -- The Definitive Edition) via the real
+`dlssnr.appimage` GUI for the first time this project has been tested against
+something other than `vkcube`, and hit two real problems -- one a genuine bug in this
+project's own code, one a pre-existing system configuration conflict, unrelated to
+anything shipped here.
+
+**Real bug, now fixed: the helper crashed on every single real start attempt.**
+`dlssnr_supervisor::start()` (the function both `dlssnr-gui`'s Start button and
+`dlssnr-cli start` call) never set `STEAM_COMPAT_CLIENT_INSTALL_PATH` -- Proton's own
+launch script reads it directly out of the environment with no fallback
+(`os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]`, a bare `KeyError` if unset) during
+its own prefix setup, *before* it ever gets to running `dlssnr_helper.exe` at all. The
+real irony: every one of this project's own manual SSH test sessions on `lordnikon`
+(the ones that produced the "first confirmed neural-rendering success" and every
+composition/GPU-dispatch verification since) set this exact variable by hand, every
+single time, specifically because it's needed -- but that fix never made it back into
+`start()` itself, so the *actual* production code path a real user hits was broken the
+whole time this project's own testing kept working around it live, unnoticed until a
+real user hit it on a real game. **Fixed** by adding `dlssnr_supervisor::paths::steam_install_dir`
+(checks the same native/Flatpak/Snap Steam-root candidates `dlssnr-cli`'s own Proton
+discovery already scans for `compatibilitytools.d`, returns the first real directory)
+and wiring it into `start()`. 2 new tests (a real filesystem + env var override,
+confirming both the found and not-found cases). A concrete lesson for this project's
+own process, not just this one bug: a fix applied only in a throwaway test harness,
+never the real code path, is not actually fixed.
+
+**Not a bug in this project, found and reported, deliberately not touched without
+asking**: `~/.config/environment.d/dlssnr.conf`, a systemd user-environment.d file
+(almost certainly left behind by *upstream's own* installer at some point, given the
+filename and that this project creates no such file anywhere) sets
+`VK_INSTANCE_LAYERS="VK_LAYER_NV_dlssnr:VK_LAYER_NV_present"` -- globally, for every
+Vulkan application in the whole graphical session, confirmed via
+`systemctl --user show-environment` and by reading `/proc/<pid>/environ` for both the
+real `dlssnr-gui` process and the real game process, both showing it. This explicitly,
+unconditionally force-activates *upstream's* real layer for literally everything,
+including a game whose own launch options only ever set `VKLayer_DLSS5=1` (this
+project's own implicit-activation variable) with no
+`VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_dlssnr` to counteract the global override --
+unlike every one of this project's own `vkcube` tests, which always explicitly
+disabled upstream's layer first. Plausible real consequences: this project's own
+layer showing as "not attached" in its own GUI (upstream's real layer, not this
+one, is what's actually active for real games on this machine), and -- if both
+layers end up in the same chain simultaneously -- two entirely separate real neural
+rendering passes running per frame, a real, substantial performance cost with an
+entirely mundane explanation, not a bug in anything shipped here. This is the user's
+own session-wide configuration (probably a leftover from originally setting up
+upstream's own product on this machine), not this project's file to edit
+unilaterally -- flagged for a real, deliberate decision (edit/remove the global
+override, or just add the same per-game `VK_LOADER_LAYERS_DISABLE` this project's own
+testing always uses to the affected game's own Steam launch options) rather than
+touched on its own judgment.
+
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
 ## helper's answer actually reaches the write-back too, not yet verified against a
