@@ -298,43 +298,73 @@ also crash on a real player's machine, not just this dev box. **This is the sing
 most important thing to fix in this project right now** — nothing past
 `vkCreateInstance` can work while this holds.
 
-What's actually established, precisely, via direct `gdb` reproduction (not
-inference):
+What's actually established, precisely, via direct `gdb` reproduction and a long,
+systematic bisection (not inference) — **this took an entire extra investigation pass
+past the first writeup below to get this far, so please read all of it before
+re-testing any of the already-ruled-out hypotheses**:
+
 - Crash signature: `SIGSEGV` inside `libVkLayer_MESA_device_select.so`, reached via
   `vulkan_layer::Global<DlssnrLayer>::create_instance` →
   `ash::vk::features::EntryFnV1_0::load` → the next layer's real `vkCreateInstance` —
   i.e., the crash is standard, correct framework code (Google's `vulkan_layer` crate,
   not anything we wrote) calling into Mesa, and Mesa's own code is what actually
   faults.
-- **Ruled out: not a general bug in the `vulkan_layer` crate or in implicit-layer
-  activation itself.** Built and ran the crate's own bundled `hello-world` reference
-  example (a true no-op layer, `StubDeviceInfo`, no real hooks) against the identical
-  environment (same machine, same Mesa `device_select` active) via **both** explicit
-  (`VK_INSTANCE_LAYERS`) and implicit (`enable_environment`) activation — clean in
-  both cases, no crash, ran to completion. Whatever's wrong is specific to this
-  project's layer, not the framework or this machine's Vulkan stack in general.
-- **Ruled out: not `manifest.spec_version`.** Upstream declares `"1.3.277"`; ours
-  declared the bare `vk::API_VERSION_1_3` (effectively 1.3.0). Changed it to
-  `vk::API_VERSION_1_1` (matching the reference example's own convention) to test —
-  **no effect**; still crashes 100% of the time under implicit activation. Left as
-  `1_1` since it's arguably the more conservative choice and matches the reference
-  crate's own example, but be clear: **this is not the fix**, don't waste time
-  re-testing spec_version values as a lead.
-- **The real, still-unexplained differentiator: explicit vs. implicit activation of
-  the exact same compiled `.so`.** `VK_INSTANCE_LAYERS=<our layer name>` (explicit) →
-  clean, real device hook, real swapchains, no crash, confirmed twice. The identical
-  binary loaded implicitly via `VKLayer_DLSS5=1` (matching its real manifest's
-  `enable_environment`, exactly how it will always actually be loaded in practice) →
-  segfault, confirmed five times in a row. Nothing in this project's own code branches
-  on how it was activated — this points at either a genuine difference in what the
-  loader hands the layer chain depending on activation type (specifically interacting
-  badly with something about this project's `DeviceInfo`/hooked-commands set, since
-  hello-world's true no-op `StubDeviceInfo` doesn't trigger it either way), or a subtler
-  ABI/state issue in this project's own `Layer` impl that only manifests under one
-  activation path. **Not yet isolated further** — the next step is bisecting
-  `DlssnrDeviceInfo`'s hooked-command list (try `StubDeviceInfo` with the real
-  manifest/implicit activation, see if the crash disappears) rather than guessing at
-  more manifest fields.
+- **Ruled out: chain position/ordering, definitively.** `VK_LOADER_DEBUG=layer`
+  confirms our layer sits *before* Mesa's `device_select` in the chain
+  (`App → dlssnr_neural → device_select → Drivers`) when activated implicitly — i.e.
+  we call *into* Mesa. Checked upstream's real, working layer in the identical
+  implicit-activation scenario: **it sits in the exact same position** (also calls
+  into Mesa the same way) **and does not crash.** So chain position alone isn't it.
+- **Ruled out: `DlssnrDeviceInfo`/the device hooks entirely.** Temporarily swapped
+  `type DeviceInfo`/`DeviceInfoContainer` to `StubDeviceInfo` (true no-op, matching the
+  reference example) and stubbed `create_device_info` to `Default::default()`, keeping
+  the real manifest and implicit activation — **still crashes, 3/3 runs.** Whatever
+  this is, it has nothing to do with what device-level functions we hook.
+- **Ruled out: the `CURRENT_INSTANCE` static/Mutex side effect in
+  `create_instance_info`.** Removed the store entirely (pure `Default::default()`,
+  byte-for-byte matching the reference example's own `create_instance_info`) — still
+  crashes, 3/3.
+- **Ruled out: every other module in this crate.** With `DeviceInfo` already stubbed,
+  `composition`/`capture`/`device`/`shm`/`swapchain`/`logging` were fully dead code —
+  commented out all six `mod` declarations (and the now-orphaned `use device::...`),
+  producing a `.so` that is, in Rust-level shape, essentially identical to the
+  reference example (same `Layer` impl shape, same `Stub*` types throughout, similar
+  final size: 24.7 MB vs. the reference's 24.98 MB). **Still crashes, 3/3.**
+- **Ruled out: `dlssnr-protocol` and `libc` as dependencies.** Removed both from
+  `crates/layer/Cargo.toml` for this same minimal build (neither was even referenced
+  anymore once the modules above were gone) — **still crashes, 3/3.**
+- **Ruled out: `panic = "abort"` vs. `"unwind"`.** The reference example's own
+  `Cargo.toml` sets `panic = "abort"` too, but `cargo tree` warns that setting is
+  ignored there because it isn't the workspace root — checked the *real* root
+  (`vk-layer-for-rust`'s own top-level `Cargo.toml`) and it sets the identical
+  `panic = "abort"` for both profiles. Both builds use the same panic strategy after
+  all.
+- **Ruled out (as far as it's practical to pin): transitive dependency version skew.**
+  `cargo tree` showed our workspace resolving newer patch versions of several of
+  `vulkan-layer`'s own transitive deps than the reference example's isolated lockfile
+  (`bytemuck` 1.25.2 vs. 1.16.1, `thiserror` 1.0.69 vs 1.0.61, `log` 0.4.34 vs 0.4.22,
+  `once_cell` 1.21.4 vs 1.19.0, `quote`/`cfg-if`/`autocfg` similarly newer) — `ash` and
+  `vulkan-layer` itself (same pinned git commit) were already identical either way.
+  Pinned every one of these down to the reference's exact version via `cargo update -p
+  <pkg> --precise <ver>` (`smallvec` and `proc-macro2`/`syn` couldn't be forced down —
+  other workspace members' own minimum-version requirements blocked it) and rebuilt —
+  **still crashes, 3/3.**
+- **What's left, genuinely not yet tested**: the two dependency versions that
+  couldn't be pinned down to match (`smallvec`, `proc-macro2`/`syn` — both are
+  extremely unlikely candidates: `smallvec` is a data structure with no obvious reason
+  to affect an unrelated crate's FFI boundary, and `proc-macro2`/`syn` only run at
+  *compile* time generating code, not at runtime); building this crate in a
+  completely standalone directory with no parent workspace at all (to rule out any
+  workspace-resolution effect this bisection hasn't captured); and the possibility
+  that this is a genuine bug in the pinned `vulkan-layer` crate commit itself that only
+  reproduces with *this specific machine's* Mesa/driver build, which would need
+  filing upstream with Google's repo to make further progress on.
+- **All bisect edits were reverted after each test** — `crates/layer/src/lib.rs`,
+  `crates/layer/Cargo.toml`, and `Cargo.lock` are all back to their real, correct,
+  committed state (confirmed via `git diff --stat` showing nothing) — nothing about
+  this investigation is reflected in the actual code. `spec_version = vk::API_VERSION_1_1`
+  (a real, if inert, change from the first pass of this investigation) is still in
+  place from before; see below.
 - Reproduce with: real machine (needs actual Mesa `device_select` present — check
   `/usr/share/vulkan/implicit_layer.d/VkLayer_MESA_device_select.json` exists),
   `VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_dlssnr` (keeps upstream's real layer out of the
@@ -344,7 +374,12 @@ inference):
   WSI mode doesn't create an X11-visible window and can't be screenshotted with
   `import`/`xdotool` the way everything else in this project's testing has been —
   `--width`/`--height` don't change that; process liveness/log output/gdb are the only
-  ways to observe it, not a screenshot.
+  ways to observe it, not a screenshot. When testing a hand-written manifest for any
+  comparison layer, remember the Vulkan loader **requires both `enable_environment`
+  and `disable_environment`** for a valid implicit-layer manifest — a manifest missing
+  either gets silently skipped with only a `WARNING` in `VK_LOADER_DEBUG=all` output,
+  easy to mistake for "this layer works fine" when it was actually never loaded at all
+  (this cost real time in this investigation itself).
 
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
