@@ -87,7 +87,7 @@ impl Layer for DlssnrLayer {
     fn manifest() -> LayerManifest {
         let mut manifest = LayerManifest::default();
         manifest.name = LAYER_NAME;
-        manifest.spec_version = vk::API_VERSION_1_3;
+        manifest.spec_version = vk::API_VERSION_1_1;
         manifest.implementation_version = 1;
         manifest.description = "DLSS 5 Neural Rendering injection layer (Linux side)";
         manifest

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.5 — 2026-09-10
+
+- No fix in this release — documenting a critical, confirmed bug found while testing
+  against real hardware with a legitimate NGX DLL for the first time: this project's
+  Vulkan layer segfaults 100% of the time when loaded the way it will always actually
+  be loaded (implicit activation via `VKLayer_DLSS5=1`), in the presence of Mesa's
+  `device_select` implicit layer. Upstream, tested side by side on the same machine,
+  works correctly end to end. See CLAUDE.md for the full, gdb-verified writeup — what's
+  ruled out, what isn't yet, and how to reproduce it.
+- Runtime SHM directory permissions note: if DLSS5 NR silently refuses to work, check
+  `/tmp/dlssnr-$UID` is `0700` (owner-only) — both this project's and upstream's own
+  security check correctly reject a group-writable runtime directory.
+
 ## 0.1.4 — 2026-09-10
 
 - The write-back now uses the helper's actual answer instead of always

@@ -270,6 +270,82 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   is now a thin binary wrapper around the `dlssnr_helper` library crate. Keep this
   split; it's what makes the Wine-based example tests above possible at all.
 
+## CRITICAL, confirmed, NOT YET FIXED: the layer crashes on its own real activation
+## path (2026-09-10, `lordnikon`)
+
+**Upstream, for the record, fully works.** With a real, legitimately-signed
+`nvngx_dlssnr.dll` in place (verified via `osslsigncode` — NVIDIA Corporation,
+DigiCert chain, valid — after multiple wrong/tampered files were correctly rejected
+earlier), upstream's real installed package (`dlssnr` 0.2.6-1) was run end-to-end for
+the first time this project has ever seen: real `vkcube` frames, real
+`VULKAN_CreateFeature(18)` success (`handle` non-null, real size), real
+`EvaluateFeature`, real NV optical flow, `[helper] neural ready`. The one thing that
+had to be fixed to get there wasn't code: `/tmp/dlssnr-1000` (the SHM runtime dir) was
+`0775` instead of `0700` — group-writable, likely from an earlier session's shell
+umask — and both upstream's and our own "refuse a non-private directory" security
+check correctly rejected it. `chmod 700` fixed it immediately. **If DLSS5 NR ever
+silently refuses to work on a real setup, check this first.**
+
+**Our own layer does not work — it segfaults every time it's loaded the way it will
+always actually be loaded.** `VK_LAYER_dlssnr_neural` (`crates/layer`, built from the
+same commit released as `v0.1.4`) crashes 100% of the time when activated implicitly
+via `VKLayer_DLSS5=1` (its real, only, intended activation mechanism — identical to
+how upstream's own layer activates) in the presence of Mesa's `device_select` implicit
+layer (`libVkLayer_MESA_device_select.so`) — which is present and active by default on
+this machine, and is common enough on Linux desktops generally (anything with more
+than one GPU, or some distros' default Vulkan setup) that this would very plausibly
+also crash on a real player's machine, not just this dev box. **This is the single
+most important thing to fix in this project right now** — nothing past
+`vkCreateInstance` can work while this holds.
+
+What's actually established, precisely, via direct `gdb` reproduction (not
+inference):
+- Crash signature: `SIGSEGV` inside `libVkLayer_MESA_device_select.so`, reached via
+  `vulkan_layer::Global<DlssnrLayer>::create_instance` →
+  `ash::vk::features::EntryFnV1_0::load` → the next layer's real `vkCreateInstance` —
+  i.e., the crash is standard, correct framework code (Google's `vulkan_layer` crate,
+  not anything we wrote) calling into Mesa, and Mesa's own code is what actually
+  faults.
+- **Ruled out: not a general bug in the `vulkan_layer` crate or in implicit-layer
+  activation itself.** Built and ran the crate's own bundled `hello-world` reference
+  example (a true no-op layer, `StubDeviceInfo`, no real hooks) against the identical
+  environment (same machine, same Mesa `device_select` active) via **both** explicit
+  (`VK_INSTANCE_LAYERS`) and implicit (`enable_environment`) activation — clean in
+  both cases, no crash, ran to completion. Whatever's wrong is specific to this
+  project's layer, not the framework or this machine's Vulkan stack in general.
+- **Ruled out: not `manifest.spec_version`.** Upstream declares `"1.3.277"`; ours
+  declared the bare `vk::API_VERSION_1_3` (effectively 1.3.0). Changed it to
+  `vk::API_VERSION_1_1` (matching the reference example's own convention) to test —
+  **no effect**; still crashes 100% of the time under implicit activation. Left as
+  `1_1` since it's arguably the more conservative choice and matches the reference
+  crate's own example, but be clear: **this is not the fix**, don't waste time
+  re-testing spec_version values as a lead.
+- **The real, still-unexplained differentiator: explicit vs. implicit activation of
+  the exact same compiled `.so`.** `VK_INSTANCE_LAYERS=<our layer name>` (explicit) →
+  clean, real device hook, real swapchains, no crash, confirmed twice. The identical
+  binary loaded implicitly via `VKLayer_DLSS5=1` (matching its real manifest's
+  `enable_environment`, exactly how it will always actually be loaded in practice) →
+  segfault, confirmed five times in a row. Nothing in this project's own code branches
+  on how it was activated — this points at either a genuine difference in what the
+  loader hands the layer chain depending on activation type (specifically interacting
+  badly with something about this project's `DeviceInfo`/hooked-commands set, since
+  hello-world's true no-op `StubDeviceInfo` doesn't trigger it either way), or a subtler
+  ABI/state issue in this project's own `Layer` impl that only manifests under one
+  activation path. **Not yet isolated further** — the next step is bisecting
+  `DlssnrDeviceInfo`'s hooked-command list (try `StubDeviceInfo` with the real
+  manifest/implicit activation, see if the crash disappears) rather than guessing at
+  more manifest fields.
+- Reproduce with: real machine (needs actual Mesa `device_select` present — check
+  `/usr/share/vulkan/implicit_layer.d/VkLayer_MESA_device_select.json` exists),
+  `VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_dlssnr` (keeps upstream's real layer out of the
+  way without touching its system-owned manifest), `VKLayer_DLSS5=1`, plain
+  `vkcube --width 1920 --height 1080` (or under `gdb -batch -ex run -ex bt --args
+  vkcube ...` for a fresh backtrace). Also worth knowing: `vkcube`'s default (Wayland)
+  WSI mode doesn't create an X11-visible window and can't be screenshotted with
+  `import`/`xdotool` the way everything else in this project's testing has been —
+  `--width`/`--height` don't change that; process liveness/log output/gdb are the only
+  ways to observe it, not a screenshot.
+
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
 ## helper's answer actually reaches the write-back too, not yet verified against a
