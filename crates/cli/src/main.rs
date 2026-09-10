@@ -6,6 +6,7 @@
 
 mod gpu;
 mod runners;
+mod shmctl;
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -26,7 +27,9 @@ fn usage() {
          \x20 config               print effective config\n\
          \x20 runners              list discovered custom compatibility tool runners\n\
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
-         \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir"
+         \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir\n\
+         \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
+         \x20                     instance's live SHM header (see `shmctl help`)"
     );
 }
 
@@ -290,6 +293,7 @@ fn main() -> ExitCode {
         "runners" => cmd_runners(),
         "detect-gpu" => cmd_detect_gpu(),
         "import-binaries" => cmd_import_binaries(args.get(2)),
+        "shmctl" => shmctl::run(&args[2..]),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

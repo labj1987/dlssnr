@@ -36,7 +36,8 @@ see [Legal](#legal) before you use it.
 - GTK4/libadwaita settings app for all of the above, live-bound to the running layer
   over the same shared-memory segment.
 - A CLI (`dlssnr-cli`) for runner discovery, starting/stopping the helper, status,
-  diagnostics, and importing the NVIDIA NGX DLLs — no bash script, no root step.
+  diagnostics, importing the NVIDIA NGX DLLs, and raw settings introspection
+  (`shmctl status`/`set`/`toggle`/`capture`) — no bash script, no root step.
 - Everything lives under `~/.local/share`, `~/.config`, and `/tmp/dlssnr-$UID/`. No
   polkit, no pkexec, no privileged install step at all.
 

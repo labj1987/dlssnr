@@ -842,18 +842,24 @@ integration also not working against *that specific file*, not evidence our port
 NGX call sequence is wrong — there's no legitimate model file on hand to actually
 prove the happy path end-to-end yet on either implementation.
 
-**A rich settings surface exists that neither the GUI nor the SHM header fully expose
-as user-facing controls yet** (upstream's `dlssnr-shmctl settings` lists ~35 tunables;
-our protocol crate already has fields for most of them — `transfer`, `debug_view`,
-`compare_mode`/`compare_split`/`compare_zoom`/`compare_swap`, `colour_mode`,
-`white_point_source`/`white_point_trim`, `apply_model`, `hold_frame`,
-`unlock_passes`, `toggle_key` — but `ui.rs` only ever binds a subset of them to rows).
-Also, upstream ships a separate `dlssnr-shmctl` debug/introspection CLI (raw
-`status`/`set`/`toggle`/`capture` against the live SHM header) that this port has no
-equivalent of. Neither is fixed here — flagging both as real, found gaps for a future
-pass, not implemented now because the settings-persistence fix above was the concrete,
-well-evidenced issue this comparison actually turned up as broken, and both of these
-are scope additions rather than bug fixes.
+**A rich settings surface exists that the GUI doesn't fully expose as user-facing
+controls yet** (upstream's `dlssnr-shmctl settings` lists ~35 tunables; our protocol
+crate already has fields for most of them — `transfer`, `compare_mode`/`compare_split`/
+`compare_zoom`/`compare_swap`, `colour_mode`, `white_point_source`/`white_point_trim`,
+`hold_frame`, `unlock_passes`, `toggle_key` — but `ui.rs` only ever binds a subset of
+them to rows). Not fixed here — a real GUI redesign to add more rows is a scope
+addition, not a bug fix, and out of place in this same pass.
+
+**Fixed 2026-09-10**: the other gap this section used to also flag -- upstream's
+separate `dlssnr-shmctl` debug/introspection CLI (raw `status`/`set`/`toggle`/`capture`
+against the live SHM header), which this port had no equivalent of -- is done now:
+`dlssnr-cli shmctl` (`crates/cli/src/shmctl.rs`), covering all 21
+`persisted_settings` plus the real, live-behavior fields worth raw access
+(`debug_view`, `apply_model`, `compare_mode`, `hold_frame`, `capture_request`) and a
+`status` view that also surfaces `helper_state`/`model_up`/`helper_frames`. Same
+"attach to the mapping and poke it" mechanism `cmd_config`/the GUI's own settings
+binding already use, not new plumbing. 10 new tests on the pure resolve/store/toggle
+logic (no real mapping needed for those), full suite still green.
 
 ## `supervisor` (added 2026-09-09: extracted from `cli` so the GUI can start/stop too)
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.10 — 2026-09-10
+
+- **`dlssnr-cli shmctl`** (`crates/cli/src/shmctl.rs`, new): the real equivalent of
+  upstream's separate `dlssnr-shmctl` debug/introspection tool this project had none
+  of before — `status` (all 21 persisted settings plus live `helper_state`/`model_up`/
+  `helper_frames`/`debug_view`/`apply_model`/`compare_mode`/`hold_frame`/
+  `capture_request`), `set <name> <value>`, `toggle <name>`, and `capture [view]` (the
+  same real frame-dump this project used to first visually verify its composition
+  output). 10 new tests on the pure resolve/store/toggle logic; full suite green.
+
 ## 0.1.9 — 2026-09-10
 
 - Real `ShmHeader::capture_request` support (`crates/layer/src/dump.rs`, new):

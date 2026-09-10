@@ -1,0 +1,273 @@
+//! `dlssnr-cli shmctl` — raw status/set/toggle/capture against the live SHM header,
+//! the real equivalent of upstream's own separate `dlssnr-shmctl` debug/introspection
+//! tool (see the workspace `CLAUDE.md`'s "compared against a real, installed upstream
+//! instance" entry: this project had no equivalent of it before now). Deliberately a
+//! subcommand of `dlssnr-cli` rather than its own binary -- one fewer thing to build,
+//! package, and document for what is fundamentally the same "attach to the mapping and
+//! poke it" job `cmd_config`/the GUI's settings binding already do.
+//!
+//! `status`/`set`/`toggle` operate on the same 21-setting surface
+//! `dlssnr_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
+//! define (so a value changed here also gets written to `config.ini` on the GUI's next
+//! save, the same as changing it from the GUI would), plus a handful of real,
+//! genuinely useful fields that aren't user-facing "settings" in that sense --
+//! `debug_view`/`capture_request` in particular, which is what makes this the actual
+//! tool this project first used to visually confirm the composition pipeline produces
+//! correct output (see `CLAUDE.md`'s "First confirmed *correct visual output*" entry).
+
+use dlssnr_protocol::ShmHeader;
+use std::sync::atomic::Ordering;
+
+fn usage() {
+    eprintln!(
+        "usage: dlssnr-cli shmctl <status|set|toggle|capture>\n\n\
+         \x20 status              print every setting and live status field\n\
+         \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
+         \x20 toggle <name>       flip a 0/1-valued setting\n\
+         \x20 capture [view]      dump the next frame's original+composited PNGs\n\
+         \x20                     (see dlssnr_layer::dump); optional debug_view 0-3\n\n\
+         Respects $DLSSNR_SHM/$DLSSNR_UID, same as every other tool in this workspace."
+    );
+}
+
+/// Extra fields worth real `set`/`toggle` access beyond the 21
+/// `persisted_settings` already covers -- real, live-behavior fields, not persisted
+/// user preferences, so listed here rather than added to that list.
+fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::atomic::AtomicU32, bool)> {
+    Some(match name {
+        "debug_view" => (&header.debug_view, false),
+        "apply_model" => (&header.apply_model, false),
+        "compare_mode" => (&header.compare_mode, false),
+        "hold_frame" => (&header.hold_frame, false),
+        "capture_request" => (&header.capture_request, false),
+        _ => return None,
+    })
+}
+
+fn helper_state_name(v: u32) -> &'static str {
+    use dlssnr_protocol::enums::helper_state::*;
+    match v {
+        STARTING => "starting",
+        NO_VULKAN => "no_vulkan",
+        NO_BINARIES => "no_binaries",
+        MODEL_FAILED => "model_failed",
+        RUNNING => "running",
+        STOPPED => "stopped",
+        _ => "unknown",
+    }
+}
+
+fn cmd_status(header: &ShmHeader) {
+    println!("# live status");
+    println!("helper_state={} ({})", header.helper_state.load(Ordering::Relaxed), helper_state_name(header.helper_state.load(Ordering::Relaxed)));
+    println!("model_up={}", header.model_up.load(Ordering::Relaxed));
+    let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
+    println!("helper_frames={frames}");
+    println!("debug_view={}", header.debug_view.load(Ordering::Relaxed));
+    println!("apply_model={}", header.apply_model.load(Ordering::Relaxed));
+    println!("compare_mode={}", header.compare_mode.load(Ordering::Relaxed));
+    println!("hold_frame={}", header.hold_frame.load(Ordering::Relaxed));
+    println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
+    println!("# settings (dlssnr_protocol::ShmHeader::persisted_settings)");
+    for (name, is_float, bits) in header.persisted_settings() {
+        if is_float {
+            println!("{name}={}", f32::from_bits(bits));
+        } else {
+            println!("{name}={bits}");
+        }
+    }
+}
+
+/// Shared by `set`/`toggle`: resolves `name` against the 21 persisted settings first,
+/// then the extra live-status fields, returning whether it's float-valued and its
+/// current raw bits -- `None` if `name` isn't recognized by either.
+fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
+    if let Some((_, is_float, bits)) = header.persisted_settings().into_iter().find(|(n, ..)| *n == name) {
+        return Some((is_float, bits));
+    }
+    extra_field(header, name).map(|(field, is_float)| (is_float, field.load(Ordering::Relaxed)))
+}
+
+fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
+    if header.persisted_settings().iter().any(|(n, ..)| *n == name) {
+        header.apply_persisted_setting(name, bits);
+        return true;
+    }
+    if let Some((field, _)) = extra_field(header, name) {
+        field.store(bits, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
+    let Some((is_float, _)) = resolve(header, name) else {
+        eprintln!("shmctl set: unknown setting {name:?}");
+        return false;
+    };
+    let bits = if is_float {
+        match value.parse::<f32>() {
+            Ok(v) => v.to_bits(),
+            Err(_) => {
+                eprintln!("shmctl set: {name} takes a decimal value, got {value:?}");
+                return false;
+            }
+        }
+    } else {
+        match value.parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("shmctl set: {name} takes an integer value, got {value:?}");
+                return false;
+            }
+        }
+    };
+    store(header, name, bits);
+    println!("{name}={value}");
+    true
+}
+
+fn cmd_toggle(header: &ShmHeader, name: &str) -> bool {
+    let Some((is_float, bits)) = resolve(header, name) else {
+        eprintln!("shmctl toggle: unknown setting {name:?}");
+        return false;
+    };
+    if is_float {
+        eprintln!("shmctl toggle: {name} is a float-valued setting, use `set` instead");
+        return false;
+    }
+    let new = u32::from(bits == 0);
+    store(header, name, new);
+    println!("{name}={new}");
+    true
+}
+
+fn cmd_capture(header: &ShmHeader, view: Option<&str>) -> bool {
+    if let Some(view) = view {
+        let Ok(mode) = view.parse::<u32>() else {
+            eprintln!("shmctl capture: debug_view must be 0-3, got {view:?}");
+            return false;
+        };
+        header.debug_view.store(mode, Ordering::Relaxed);
+    }
+    header.capture_request.store(1, Ordering::Relaxed);
+    println!("capture_request set -- check $XDG_DATA_HOME/dlssnr/captures on the layer's next present");
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_finds_a_persisted_setting() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        let (is_float, bits) = resolve(&header, "colour_strength").expect("colour_strength should resolve");
+        assert!(is_float);
+        assert_eq!(f32::from_bits(bits), 1.0);
+    }
+
+    #[test]
+    fn resolve_finds_an_extra_field() {
+        let header = ShmHeader::default();
+        let (is_float, bits) = resolve(&header, "debug_view").expect("debug_view should resolve");
+        assert!(!is_float);
+        assert_eq!(bits, 0);
+    }
+
+    #[test]
+    fn resolve_rejects_an_unknown_name() {
+        let header = ShmHeader::default();
+        assert!(resolve(&header, "not_a_real_setting").is_none());
+    }
+
+    #[test]
+    fn store_writes_through_persisted_settings() {
+        let header = ShmHeader::default();
+        assert!(store(&header, "colour_strength", 0.25f32.to_bits()));
+        assert_eq!(header.colour_strength_bits.load(Ordering::Relaxed), 0.25f32.to_bits());
+    }
+
+    #[test]
+    fn store_writes_through_extra_fields() {
+        let header = ShmHeader::default();
+        assert!(store(&header, "debug_view", 3));
+        assert_eq!(header.debug_view.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn store_rejects_an_unknown_name() {
+        let header = ShmHeader::default();
+        assert!(!store(&header, "not_a_real_setting", 1));
+    }
+
+    #[test]
+    fn cmd_toggle_flips_a_boolean_field_both_ways() {
+        let header = ShmHeader::default();
+        assert!(cmd_toggle(&header, "apply_model"));
+        assert_eq!(header.apply_model.load(Ordering::Relaxed), 1);
+        assert!(cmd_toggle(&header, "apply_model"));
+        assert_eq!(header.apply_model.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cmd_toggle_refuses_a_float_field() {
+        let header = ShmHeader::default();
+        assert!(!cmd_toggle(&header, "colour_strength"));
+    }
+
+    #[test]
+    fn cmd_set_rejects_a_non_numeric_value_for_a_float_field() {
+        let header = ShmHeader::default();
+        assert!(!cmd_set(&header, "colour_strength", "not-a-number"));
+    }
+
+    #[test]
+    fn helper_state_name_covers_every_real_state() {
+        use dlssnr_protocol::enums::helper_state::*;
+        for state in [STARTING, NO_VULKAN, NO_BINARIES, MODEL_FAILED, RUNNING, STOPPED] {
+            assert_ne!(helper_state_name(state), "unknown");
+        }
+        assert_eq!(helper_state_name(9999), "unknown");
+    }
+}
+
+pub fn run(args: &[String]) -> std::process::ExitCode {
+    let Some(mapping) = dlssnr_protocol::mapping::open() else {
+        eprintln!("shmctl: failed to open the SHM mapping (see $DLSSNR_SHM/$DLSSNR_UID)");
+        return std::process::ExitCode::FAILURE;
+    };
+    let header = mapping.header();
+
+    let ok = match args.first().map(String::as_str) {
+        Some("status") => {
+            cmd_status(header);
+            true
+        }
+        Some("set") => match (args.get(1), args.get(2)) {
+            (Some(name), Some(value)) => cmd_set(header, name, value),
+            _ => {
+                eprintln!("usage: dlssnr-cli shmctl set <name> <value>");
+                false
+            }
+        },
+        Some("toggle") => match args.get(1) {
+            Some(name) => cmd_toggle(header, name),
+            None => {
+                eprintln!("usage: dlssnr-cli shmctl toggle <name>");
+                false
+            }
+        },
+        Some("capture") => cmd_capture(header, args.get(1).map(String::as_str)),
+        _ => {
+            usage();
+            false
+        }
+    };
+    if ok {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
