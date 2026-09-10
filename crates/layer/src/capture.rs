@@ -357,6 +357,12 @@ pub unsafe fn run(
     // type/size `ensure` just built or confirmed already satisfies this call's own
     // `frame_bytes`).
     let captured = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
+    // Composition (below) needs the pre-edit frame after `read_answer` has already
+    // overwritten `r.ptr` in place, so it has to be copied out now, before that
+    // happens -- one extra `frame_bytes`-sized allocation/copy per frame, on top of
+    // the two Vulkan transfers this function already does; not yet worth avoiding
+    // ahead of proving the composition path correct at all.
+    let original = captured.to_vec();
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
     let answered = shm.try_round_trip();
@@ -365,6 +371,27 @@ pub unsafe fn run(
         // writes past the slice's length, which is exactly `frame_bytes` here.
         let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
         shm.read_answer(answer_dst);
+        // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
+        // through untouched (see `composition::apply`'s own doc comment for why, and
+        // `dlssnr_protocol::enums::proxy_format` for the format codes).
+        if proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8 {
+            if let Some(settings) = shm.composition_settings() {
+                if settings.apply_model {
+                    crate::composition::apply::apply_rgba8(
+                        &original,
+                        answer_dst,
+                        settings.colour_strength,
+                        settings.transfer_strength,
+                        settings.max_ratio,
+                        settings.debug_view,
+                    );
+                } else {
+                    // "Off keeps the whole pass running... and simply presents the
+                    // clean frame" -- ShmHeader::apply_model's own doc comment.
+                    answer_dst.copy_from_slice(&original);
+                }
+            }
+        }
     }
     crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
 

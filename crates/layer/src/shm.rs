@@ -21,6 +21,17 @@ use std::time::{Duration, Instant};
 
 use dlssnr_protocol::{enums::helper_state, shm_default_path, MAX_FRAME, SHM_MAGIC};
 
+/// The subset of `ShmHeader`'s composition fields `composition::apply::apply_rgba8`
+/// needs, decoded once per frame from the raw atomics. See that field's own doc
+/// comment in `dlssnr_protocol::header::ShmHeader` for what each one means.
+pub struct CompositionSettings {
+    pub colour_strength: f32,
+    pub transfer_strength: f32,
+    pub max_ratio: f32,
+    pub debug_view: u32,
+    pub apply_model: bool,
+}
+
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
 /// per device, guarded by a `Mutex` in [`crate::device::DlssnrDeviceInfo`].
 pub struct ShmClient {
@@ -79,6 +90,20 @@ impl ShmClient {
     pub fn model_known_unavailable(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
         hdr.helper_state.load(Ordering::Relaxed) == helper_state::MODEL_FAILED
+    }
+
+    /// The settings `composition::apply::apply_rgba8` needs, read fresh every frame
+    /// (each is a single atomic load) so a live GUI change takes effect on the very
+    /// next present rather than needing a restart. `None` before the mapping is open.
+    pub fn composition_settings(&self) -> Option<CompositionSettings> {
+        let hdr = self.header()?;
+        Some(CompositionSettings {
+            colour_strength: f32::from_bits(hdr.colour_strength_bits.load(Ordering::Relaxed)),
+            transfer_strength: f32::from_bits(hdr.transfer_strength_bits.load(Ordering::Relaxed)),
+            max_ratio: f32::from_bits(hdr.max_ratio_bits.load(Ordering::Relaxed)),
+            debug_view: hdr.debug_view.load(Ordering::Relaxed),
+            apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
+        })
     }
 
     /// Records what the proxy bytes about to be written actually are -- the helper

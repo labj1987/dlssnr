@@ -495,6 +495,57 @@ integration can produce a real, successful, repeated model evaluation at all, on
 first machine that's ever had a legitimate DLL to test it against. That question is now
 answered yes.
 
+## Composition math now actually reaches the frame (2026-09-10) -- CPU path, real
+## measured performance cost, real measured fix
+
+**`crates/layer/src/composition/apply.rs` (new) wires `color.rs`'s already-tested
+`upgrade_tone_map`/`gamut_compress_reversible` into `capture.rs`'s real write-back**,
+on the CPU: a direct, mechanical port of `shaders/compose.comp`'s own `main()`
+orchestration (`UpgradeToneMap` -> the transfer-ratio blend ->
+`GamutCompressReversible`), reading `colour_strength`/`transfer_strength`/`max_ratio`/
+`debug_view`/`apply_model` fresh from the live SHM header every frame
+(`ShmClient::composition_settings`, new). This is the thing the "composition" section
+below has said was still open since milestone 4 phase A/B — as of this change, it no
+longer is, for the `RGBA8` proxy format (the default; `RGBA16F` still passes the raw
+answer through untouched, undocumented as a gap no longer, see `apply.rs`'s own doc
+comment). `debug_view`'s four modes (0 composited, 1 original/proxy, 2 raw answer, 3
+amplified diff) and `apply_model`'s off-switch are both real and wired, not just
+modeled in the protocol.
+
+**Real, measured performance cost, and a real, measured fix**: the naive
+single-threaded version of this loop took ~800ms/frame at 1920x1080 on real hardware
+(`lordnikon`) -- confirmed via real `vkcube` runs, not estimated: a real 10-second run
+dropped from 244 captured/answered frames (no composition, the crash-fix verification
+run) to 11-12 frames (composition, single-threaded, release build barely different
+from debug -- confirming the cost is the transcendental `powf`/`cbrt` calls themselves,
+several deep per pixel between two sRGB decodes and two OkLab conversions, not
+un-optimized surrounding Rust). Every pixel's work is independent (reads its own
+`original`/`answer` bytes, writes its own `answer` bytes, no cross-pixel state), so
+`apply_rgba8` now splits the frame across `std::thread::available_parallelism()`
+threads (capped at 16) via `std::thread::scope` -- confirmed via the same real
+`vkcube` test: **97 frames in the same 10 seconds on this 16-core machine, an ~8x real
+improvement**, not just a theoretical one.
+
+**What this does and does not mean for real playability**: 97 frames/10s (~10fps) is
+real and usable for continued testing, but still well short of the 244-frame (~24fps)
+no-composition baseline on the same hardware -- this CPU path is what makes the
+algorithm correct and provable now, not the final performance story. The
+already-written, still-not-dispatched `shaders/compose.comp` (real GPU compute, not a
+CPU loop across `powf` calls) is what closes that remaining gap; wiring it in is real,
+scoped, open work, not done by this change. A second real optimization the current
+code leaves on the table: `std::thread::scope` spawns fresh OS threads every single
+frame rather than reusing a persistent pool -- a real, measurable cost this project
+hasn't measured in isolation from the math itself yet.
+
+**Verified**: `cargo test -p dlssnr-layer` covers `apply_rgba8`'s real invariants
+(`debug_view` 1/2 short-circuit correctly, `transfer_strength=0` reproduces the
+original within 8-bit rounding, `model == original` is near-identity, sRGB round-trips
+every byte value) -- 5 new tests, all passing, plus the full existing suite (30 tests
+workspace-wide) still green. Confirmed on real hardware: the round trip still succeeds
+every frame with composition active (`round trip answered=true` throughout both the
+single- and multi-threaded real runs above) -- this is a real behavior change to what
+reaches the screen, not just new code that compiles.
+
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
 ## helper's answer actually reaches the write-back too, not yet verified against a

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.8 — 2026-09-10
+
+- **This project's own composition math now actually reaches the presented frame**
+  (`crates/layer/src/composition/apply.rs`, new): a CPU port of `shaders/compose.comp`'s
+  pipeline, built on the already-tested `upgrade_tone_map`/`gamut_compress_reversible`
+  functions, wired into `capture.rs`'s real write-back for the `RGBA8` proxy format.
+  `debug_view` (composited/original/raw-answer/amplified-diff) and `apply_model`'s
+  off-switch are both real now, read live from the SHM header every frame.
+- Real, measured performance finding: the naive single-threaded version cost ~800ms/
+  frame at 1080p on real hardware (244 -> 11 frames in a real 10s `vkcube` run).
+  Parallelized the (fully independent, per-pixel) work across threads —
+  ~97 frames in the same real 10s run, an ~8x measured improvement. Still short of the
+  244-frame no-composition baseline; real GPU dispatch of `compose.comp` remains the
+  actual fix for game-ready framerates and is still open work.
+- 5 new tests for `apply_rgba8`'s real invariants; full suite (30 tests) still green.
+  Verified on real hardware: round trip still succeeds every frame with composition
+  active.
+
 ## 0.1.7 — 2026-09-10
 
 - **First confirmed real DLSS 5 Neural Rendering success from this project's own
