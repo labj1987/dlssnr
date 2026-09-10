@@ -239,6 +239,7 @@ pub unsafe fn run(
     height: u32,
     proxy_format: u32,
     resources: &mut Option<CaptureResources>,
+    gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
 ) -> bool {
     let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
@@ -377,14 +378,44 @@ pub unsafe fn run(
         if proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8 {
             if let Some(settings) = shm.composition_settings() {
                 if settings.apply_model {
-                    crate::composition::apply::apply_rgba8(
-                        &original,
-                        answer_dst,
-                        settings.colour_strength,
-                        settings.transfer_strength,
-                        settings.max_ratio,
-                        settings.debug_view,
-                    );
+                    // GPU dispatch (`composition::gpu`) only implements the normal
+                    // composited case (`compose.comp` has no concept of `debug_view`
+                    // at all) -- fails open to the CPU reference
+                    // (`composition::apply::apply_rgba8`, which every mode already
+                    // handles) whenever the GPU path isn't applicable, isn't
+                    // available, or fails, same fail-open discipline as every other
+                    // stage in this function.
+                    let mut composed = false;
+                    if settings.debug_view == 0 {
+                        if gpu_compose.is_none() {
+                            *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
+                        }
+                        if let Some(gpu) = gpu_compose {
+                            composed = gpu.dispatch(
+                                device,
+                                instance,
+                                physical_device,
+                                queue,
+                                width,
+                                height,
+                                &original,
+                                answer_dst,
+                                settings.colour_strength,
+                                settings.transfer_strength,
+                                settings.max_ratio,
+                            );
+                        }
+                    }
+                    if !composed {
+                        crate::composition::apply::apply_rgba8(
+                            &original,
+                            answer_dst,
+                            settings.colour_strength,
+                            settings.transfer_strength,
+                            settings.max_ratio,
+                            settings.debug_view,
+                        );
+                    }
                 } else {
                     // "Off keeps the whole pass running... and simply presents the
                     // clean frame" -- ShmHeader::apply_model's own doc comment.

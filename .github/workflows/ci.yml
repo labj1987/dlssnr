@@ -14,13 +14,19 @@ jobs:
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
-      # real system libraries via pkg-config, not just a Rust toolchain), plus mingw
-      # for the Windows-only helper crate.
+      # real system libraries via pkg-config, not just a Rust toolchain), mingw for the
+      # Windows-only helper crate, and a software Vulkan ICD (lavapipe) so
+      # dlssnr-layer's real-device tests (the GPU compose dispatch's own
+      # gpu_dispatch_matches_the_cpu_reference in particular) actually run here instead
+      # of just skipping -- this is exactly the test that caught a real shader bug
+      # before it ever reached real hardware (see CLAUDE.md), so it's worth CI
+      # actually exercising it on every push, not only locally.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
 
       - name: Install Rust
         run: rustup target add x86_64-pc-windows-gnu

@@ -98,6 +98,7 @@ struct State {
     /// to build a command pool for whatever queue `queue_present_khr` hands us.
     queue_families: HashMap<vk::Queue, u32>,
     capture: Option<capture::CaptureResources>,
+    gpu_compose: Option<crate::composition::gpu::GpuCompose>,
 }
 
 impl DlssnrDeviceInfo {
@@ -325,7 +326,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let width = sw.width;
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
-                let State { shm, capture, .. } = &mut *state;
+                let State { shm, capture, gpu_compose, .. } = &mut *state;
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
@@ -356,6 +357,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                             height,
                             proxy_format,
                             capture,
+                            gpu_compose,
                             shm,
                         );
                     }

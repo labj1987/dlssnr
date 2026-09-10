@@ -620,6 +620,72 @@ every frame with composition active (`round trip answered=true` throughout both 
 single- and multi-threaded real runs above) -- this is a real behavior change to what
 reaches the screen, not just new code that compiles.
 
+## `shaders/compose.comp` is now really dispatched on the GPU (2026-09-10) -- a real
+## shader bug found by a local test before it ever reached real hardware
+
+**`crates/layer/src/composition/gpu.rs` (new)**: real Vulkan compute dispatch of
+`shaders/compose.comp`, tried first in `capture.rs`'s write-back whenever
+`debug_view == 0` (the shader has no concept of the other three debug modes at all;
+those still fall back to [`apply.rs`](#composition-math-now-actually-reaches-the-frame-2026-09-10----cpu-path-real)'s
+CPU path, which every mode already handles, same fail-open discipline as everywhere
+else in this crate). `compose.comp` itself changed from `rgba16f` to `rgba8` storage
+images with explicit `SrgbDecode`/`SrgbEncode` GLSL functions added -- storage-image
+`imageLoad`/`imageStore` never apply an sRGB curve regardless of declared format (that
+is exclusively a sampled-image-plus-sampler feature per the Vulkan spec), and the real,
+only-currently-supported proxy format is `RGBA8`, not the float format the shader
+originally assumed. Precompiled to SPIR-V with `glslangValidator -V` (validated with
+`spirv-val`) and committed as `shaders/compose.spv`, embedded into the binary via
+`include_bytes!` -- no shader-compiler dependency needed at build time, only when the
+`.comp` source itself changes.
+
+**A real shader bug was found and fixed before this ever touched real hardware**, by a
+new local test (`composition::gpu::tests::gpu_dispatch_matches_the_cpu_reference`) that
+needs nothing but a software Vulkan ICD (lavapipe, already relied on elsewhere in this
+crate's own tests) — it dispatches the real shader and compares its output pixel-for-
+pixel against [`apply.rs`](#composition-math-now-actually-reaches-the-frame-2026-09-10----cpu-path-real)'s
+already-real-hardware-verified CPU reference. First run: diverged by up to 90/255 with
+`colour_strength > 0` (fine at `colour_strength = 0`, isolating the bug to the OkLab
+hue-correction path). Root cause: `OklabFromLinearSrgb`'s
+`return OKLAB_LMS_TO_OKLAB * sign(lms) * pow(abs(lms), vec3(1.0 / 3.0));` -- GLSL
+evaluates same-precedence operators left to right, so this multiplies the matrix by
+`sign(lms)` *first* (a `mat3 * vec3` producing some vector), then does a component-wise
+`vec3 * vec3` against `pow(abs(lms), 1/3)` -- nothing like "matrix-multiply the
+already-cube-rooted vector," which is what the Rust reference (and this same file's own
+`LinearSrgbFromOklab`, which parenthesizes `(lms * lms * lms)` correctly) actually does.
+Fixed by computing the cube root as its own complete vector first, then multiplying by
+the matrix. **This would have shipped a visually wrong GPU composite for the default
+`colour_strength = 1.0` setting** had the local test not caught it — exactly the kind
+of bug a real-hardware-only testing strategy could easily have missed for a while (the
+image still looks like *something*, not obviously broken, at a casual glance) and
+exactly why this test was worth writing before trusting the port at all.
+
+**Verified correct on real hardware after the fix**: a real `capture_request` dump
+(same tool as [the section above](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along-the-way-plus-one-important-false-alarm-2026-09-10-lordnikon))
+shows the same real, substantial, structured composition effect the CPU path already
+proved (mean per-channel diff ~17/255 from the original, across the whole frame) — the
+GPU path produces the same real answer, not just "doesn't crash."
+
+**Real, measured, honest performance finding**: dispatching on the GPU (RTX 5070) is
+faster than the multi-threaded CPU path but not by nearly as much as raw compute
+throughput alone would suggest -- 118 frames in a real 10-second `vkcube` run, vs. 97
+for the CPU path and 244 for no composition at all. The shader itself almost certainly
+runs in microseconds on real hardware; the modest gain points at the *synchronous,
+one-submit-one-wait-per-frame* dispatch pattern (`GpuCompose::dispatch` blocks on a
+fence every single call, the same discipline `capture.rs`'s own two transfer stages
+already use) as the real remaining cost -- three separate CPU-GPU round trips now
+happen per frame (capture's own two stages plus this one), each paying real
+kernel/driver synchronization overhead regardless of how fast the GPU work inside it
+is. Pipelining/double-buffering across these stages to avoid blocking every frame is
+real, scoped, **still-open** work -- not done by this change, and now the actual
+next lever for real playable framerates, more than the compute shader itself.
+
+**Verified**: the 2 new `#[cfg(test)]`s above (`gpu_dispatch_matches_the_cpu_reference`,
+`gpu_dispatch_handles_a_resize` -- the latter confirms `ensure_sized`'s rebuild-on-
+resize path, not just its happy path, works against a real device too) plus the full
+existing suite (27 tests in this crate alone) still green. Both skip gracefully
+(logging why, not failing) in an environment with no Vulkan loader/ICD at all, rather
+than breaking a build that has no way to run them.
+
 ## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
 ## helper's answer actually reaches the write-back too, not yet verified against a

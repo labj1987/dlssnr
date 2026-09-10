@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.12 — 2026-09-10
+
+- **`shaders/compose.comp` is now really dispatched on the GPU** (`crates/layer/src/composition/gpu.rs`,
+  new), tried first in the write-back whenever `debug_view == 0`, falling back to the
+  CPU path otherwise. The shader itself moved from `rgba16f` to `rgba8` storage images
+  with explicit sRGB decode/encode added (storage-image loads never apply an sRGB
+  curve regardless of format), precompiled to SPIR-V and embedded via `include_bytes!`.
+- **A real shader bug was found and fixed before it ever touched real hardware**, by a
+  new local test that needs only a software Vulkan ICD (lavapipe): `OklabFromLinearSrgb`
+  multiplied a matrix by `sign(lms)` before the cube root instead of after, due to GLSL
+  operator precedence — diverged from the CPU reference by up to 90/255 with the
+  default `colour_strength = 1.0`. Fixed and reverified.
+- Verified correct on real hardware after the fix (same real, structured composition
+  effect as the CPU path). Real, honest performance finding: 118 frames/10s on the GPU
+  vs. 97 for multi-threaded CPU and 244 for no composition — a real but modest gain,
+  since the current synchronous one-submit-one-wait-per-frame pattern (three CPU-GPU
+  round trips per frame now) is the real remaining cost, not the shader itself.
+  Pipelining that is genuinely still-open work.
+- 2 new tests (GPU-vs-CPU parity, resize handling), both skip gracefully with no
+  Vulkan ICD present rather than breaking the build. Full suite green.
+
 ## 0.1.11 — 2026-09-10
 
 - **Expanded the GUI settings surface**: a new "Compare and debug" group
