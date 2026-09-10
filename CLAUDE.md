@@ -842,20 +842,34 @@ integration also not working against *that specific file*, not evidence our port
 NGX call sequence is wrong — there's no legitimate model file on hand to actually
 prove the happy path end-to-end yet on either implementation.
 
-**A rich settings surface exists that the GUI doesn't fully expose as user-facing
-controls yet** (upstream's `dlssnr-shmctl settings` lists ~35 tunables; our protocol
-crate already has fields for most of them — `transfer`, `compare_mode`/`compare_split`/
-`compare_zoom`/`compare_swap`, `colour_mode`, `white_point_source`/`white_point_trim`,
-`hold_frame`, `unlock_passes`, `toggle_key` — but `ui.rs` only ever binds a subset of
-them to rows). Not fixed here — a real GUI redesign to add more rows is a scope
-addition, not a bug fix, and out of place in this same pass.
+**Both gaps this section used to flag are fixed now (2026-09-10).**
 
-**Fixed 2026-09-10**: the other gap this section used to also flag -- upstream's
-separate `dlssnr-shmctl` debug/introspection CLI (raw `status`/`set`/`toggle`/`capture`
-against the live SHM header), which this port had no equivalent of -- is done now:
-`dlssnr-cli shmctl` (`crates/cli/src/shmctl.rs`), covering all 21
-`persisted_settings` plus the real, live-behavior fields worth raw access
-(`debug_view`, `apply_model`, `compare_mode`, `hold_frame`, `capture_request`) and a
+**The GUI settings surface is much closer to complete**: `ui.rs` gained a new
+"Compare and debug" group (`compare_mode`/`compare_split`/`compare_zoom`/
+`compare_swap`/`debug_view`) and five new rows in Composition (`colour_mode`,
+`transfer`, `unlock_passes`, `apply_model`, `hold_frame`) — real, tested, screenshotted
+rows, not just protocol fields with nothing bound to them. This required extending
+`ShmHeader::persisted_settings`/`apply_persisted_setting` from 21 to 31 entries first
+(the function's own doc comment is explicit that both have to change together, or a
+new row would appear to save but silently fail to survive a reboot) — every one of
+these now round-trips through `config.ini` exactly like the rows that already existed.
+**Still not bound**: `white_point_source`/`white_point_trim`/`white_point_scale` (HDR
+white-point tuning, needs an HDR swapchain to be meaningful to test) and `toggle_key`
+(a raw Linux key code; a real hotkey-capture widget is a separate, larger UI piece
+than a row on an existing group). Verified by real screenshot, not just "compiles" --
+caught and fixed one real bug this way: `AdwPreferencesGroup::title` is parsed as
+Pango markup, and the first attempt at naming the new group "Compare & debug" broke it
+outright (`GTK-WARNING: Failed to set text ... Entity did not end with a semicolon`) —
+confirmed only by actually running the GUI and reading its own log, exactly the kind
+of thing a type check can't catch. Renamed to "Compare and debug".
+
+**`dlssnr-cli shmctl`** (`crates/cli/src/shmctl.rs`, new) is the real equivalent of
+upstream's separate `dlssnr-shmctl` debug/introspection CLI (raw
+`status`/`set`/`toggle`/`capture` against the live SHM header), which this port had no
+equivalent of before. Covers all 31 `persisted_settings` (now including
+`debug_view`/`apply_model`/`compare_mode`/`hold_frame`, moved there from a separate
+"extra fields" list once the GUI work above needed them to persist too) plus
+`capture_request` (a real one-shot trigger, correctly not a persisted setting), and a
 `status` view that also surfaces `helper_state`/`model_up`/`helper_frames`. Same
 "attach to the mapping and poke it" mechanism `cmd_config`/the GUI's own settings
 binding already use, not new plumbing. 10 new tests on the pure resolve/store/toggle

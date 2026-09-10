@@ -30,15 +30,13 @@ fn usage() {
     );
 }
 
-/// Extra fields worth real `set`/`toggle` access beyond the 21
-/// `persisted_settings` already covers -- real, live-behavior fields, not persisted
-/// user preferences, so listed here rather than added to that list.
+/// Extra fields worth real `set`/`toggle` access beyond what `persisted_settings`
+/// covers. Just `capture_request` now -- `debug_view`/`apply_model`/`compare_mode`/
+/// `hold_frame` moved into `persisted_settings` itself on 2026-09-10 (so a GUI change
+/// to any of them now survives a reboot too), leaving this for the one field that
+/// genuinely isn't a persisted preference: a one-shot trigger, not a setting.
 fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::atomic::AtomicU32, bool)> {
     Some(match name {
-        "debug_view" => (&header.debug_view, false),
-        "apply_model" => (&header.apply_model, false),
-        "compare_mode" => (&header.compare_mode, false),
-        "hold_frame" => (&header.hold_frame, false),
         "capture_request" => (&header.capture_request, false),
         _ => return None,
     })
@@ -63,10 +61,6 @@ fn cmd_status(header: &ShmHeader) {
     println!("model_up={}", header.model_up.load(Ordering::Relaxed));
     let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
     println!("helper_frames={frames}");
-    println!("debug_view={}", header.debug_view.load(Ordering::Relaxed));
-    println!("apply_model={}", header.apply_model.load(Ordering::Relaxed));
-    println!("compare_mode={}", header.compare_mode.load(Ordering::Relaxed));
-    println!("hold_frame={}", header.hold_frame.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
     println!("# settings (dlssnr_protocol::ShmHeader::persisted_settings)");
     for (name, is_float, bits) in header.persisted_settings() {
@@ -171,9 +165,19 @@ mod tests {
     #[test]
     fn resolve_finds_an_extra_field() {
         let header = ShmHeader::default();
-        let (is_float, bits) = resolve(&header, "debug_view").expect("debug_view should resolve");
+        let (is_float, bits) = resolve(&header, "capture_request").expect("capture_request should resolve");
         assert!(!is_float);
         assert_eq!(bits, 0);
+    }
+
+    #[test]
+    fn resolve_finds_debug_view_via_persisted_settings() {
+        // debug_view/apply_model/compare_mode/hold_frame moved into
+        // ShmHeader::persisted_settings on 2026-09-10 -- confirms this module's
+        // `extra_field` no longer needs (and no longer has) a special case for them.
+        let header = ShmHeader::default();
+        let (is_float, _) = resolve(&header, "debug_view").expect("debug_view should resolve");
+        assert!(!is_float);
     }
 
     #[test]
@@ -192,8 +196,8 @@ mod tests {
     #[test]
     fn store_writes_through_extra_fields() {
         let header = ShmHeader::default();
-        assert!(store(&header, "debug_view", 3));
-        assert_eq!(header.debug_view.load(Ordering::Relaxed), 3);
+        assert!(store(&header, "capture_request", 1));
+        assert_eq!(header.capture_request.load(Ordering::Relaxed), 1);
     }
 
     #[test]

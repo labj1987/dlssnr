@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.11 — 2026-09-10
+
+- **Expanded the GUI settings surface**: a new "Compare and debug" group
+  (`compare_mode`, `compare_split`, `compare_zoom`, `compare_swap`, `debug_view`) and
+  five new Composition rows (`colour_mode`, `transfer`, `unlock_passes`,
+  `apply_model`, `hold_frame`) — all real, tested, and verified by screenshot. Still
+  not bound: white-point HDR tuning and the raw hotkey (`toggle_key`), which needs a
+  proper key-capture widget.
+- Extended `ShmHeader::persisted_settings`/`apply_persisted_setting` from 21 to 31
+  entries so every new row actually survives a reboot through `config.ini`, not just
+  appears to save.
+- Found and fixed a real bug while verifying the above by actually running the GUI:
+  `AdwPreferencesGroup::title` is parsed as Pango markup, and naming the new group
+  "Compare & debug" broke it outright. Renamed to "Compare and debug".
+- `dlssnr-cli shmctl` now covers all 31 persisted settings (previously 21, with
+  `debug_view`/`apply_model`/`compare_mode`/`hold_frame` handled as a separate
+  non-persisted special case — folded into the main list now that the GUI needs them
+  to persist too).
+
 ## 0.1.10 — 2026-09-10
 
 - **`dlssnr-cli shmctl`** (`crates/cli/src/shmctl.rs`, new): the real equivalent of

@@ -444,7 +444,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 21] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 31] {
         [
             ("enabled", false, self.enabled.load(Ordering::Relaxed)),
             ("style", false, self.style.load(Ordering::Relaxed)),
@@ -467,6 +467,18 @@ impl ShmHeader {
             ("scaling_downscaler", false, self.scaling_downscaler.load(Ordering::Relaxed)),
             ("reversible_mode", false, self.reversible_mode.load(Ordering::Relaxed)),
             ("hdr_mode", false, self.hdr_mode.load(Ordering::Relaxed)),
+            // Added 2026-09-10 alongside the GUI rows that expose them -- see this
+            // function's own doc comment on why both have to change together.
+            ("transfer", false, self.transfer.load(Ordering::Relaxed)),
+            ("compare_mode", false, self.compare_mode.load(Ordering::Relaxed)),
+            ("compare_split", true, self.compare_split_bits.load(Ordering::Relaxed)),
+            ("compare_zoom", true, self.compare_zoom_bits.load(Ordering::Relaxed)),
+            ("compare_swap", false, self.compare_swap.load(Ordering::Relaxed)),
+            ("colour_mode", false, self.colour_mode.load(Ordering::Relaxed)),
+            ("hold_frame", false, self.hold_frame.load(Ordering::Relaxed)),
+            ("unlock_passes", false, self.unlock_passes.load(Ordering::Relaxed)),
+            ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
+            ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
         ]
     }
 
@@ -497,6 +509,16 @@ impl ShmHeader {
             "scaling_downscaler" => &self.scaling_downscaler,
             "reversible_mode" => &self.reversible_mode,
             "hdr_mode" => &self.hdr_mode,
+            "transfer" => &self.transfer,
+            "compare_mode" => &self.compare_mode,
+            "compare_split" => &self.compare_split_bits,
+            "compare_zoom" => &self.compare_zoom_bits,
+            "compare_swap" => &self.compare_swap,
+            "colour_mode" => &self.colour_mode,
+            "hold_frame" => &self.hold_frame,
+            "unlock_passes" => &self.unlock_passes,
+            "apply_model" => &self.apply_model,
+            "debug_view" => &self.debug_view,
             _ => return,
         };
         field.store(bits, Ordering::Relaxed);

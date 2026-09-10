@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use dlssnr_protocol::enums::{downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
+use dlssnr_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -138,11 +138,55 @@ pub fn build_ui(app: &adw::Application) {
     let (hdr_mode, set_hdr_mode) = bind_u32(&shm, Some("hdr_mode"), |h| &h.hdr_mode);
     comp_group.add(&combo_row("HDR input", &["Auto", "Off", "Force float16"], hdr_mode, set_hdr_mode));
 
+    let (colour_mode, set_colour_mode) = bind_u32(&shm, Some("colour_mode"), |h| &h.colour_mode);
+    comp_group.add(&combo_row("Colour mode", &["Auto", "Force display-referred", "Force linear HDR"], colour_mode, set_colour_mode));
+    debug_assert_eq!(colour_mode::AUTO, 0);
+
+    let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
+    comp_group.add(&combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer));
+
+    let (unlock_passes, set_unlock_passes) = bind_bool(&shm, Some("unlock_passes"), |h| &h.unlock_passes);
+    comp_group.add(&switch_row("Unlock pass limit", "Allow more passes than the normal ceiling", unlock_passes, set_unlock_passes));
+
+    let (apply_model, set_apply_model) = bind_bool(&shm, Some("apply_model"), |h| &h.apply_model);
+    comp_group.add(&switch_row("Apply model edit", "Off presents the clean frame — capture/transport/round-trip still run, for an honest A/B", apply_model, set_apply_model));
+
+    let (hold_frame, set_hold_frame) = bind_bool(&shm, Some("hold_frame"), |h| &h.hold_frame);
+    comp_group.add(&switch_row("Hold frame", "Freeze the frame the pass works on, to re-run composition over the same picture", hold_frame, set_hold_frame));
+
+    // --- Compare and debug ----------------------------------------------------------
+    let debug_group = adw::PreferencesGroup::new();
+    // Not "Compare & debug" -- `AdwPreferencesGroup::title` is parsed as Pango markup,
+    // and a bare `&` breaks it (confirmed via a real run: "Failed to set text ...
+    // Entity did not end with a semicolon").
+    debug_group.set_title("Compare and debug");
+
+    let (compare_mode, set_compare_mode) = bind_u32(&shm, Some("compare_mode"), |h| &h.compare_mode);
+    debug_group.add(&combo_row("Compare mode", &["Off", "Side by side", "Wipe"], compare_mode, set_compare_mode));
+
+    let (compare_split, set_compare_split) = bind_float(&shm, Some("compare_split"), |h| &h.compare_split_bits);
+    debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, 0.0, 1.0, 0.05, set_compare_split));
+
+    let (compare_zoom, set_compare_zoom) = bind_float(&shm, Some("compare_zoom"), |h| &h.compare_zoom_bits);
+    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, 0.1, 8.0, 0.1, set_compare_zoom));
+
+    let (compare_swap, set_compare_swap) = bind_bool(&shm, Some("compare_swap"), |h| &h.compare_swap);
+    debug_group.add(&switch_row("Swap compare sides", "", compare_swap, set_compare_swap));
+
+    let (debug_view, set_debug_view) = bind_u32(&shm, Some("debug_view"), |h| &h.debug_view);
+    debug_group.add(&combo_row(
+        "Debug view",
+        &["Off", "Original / proxy", "Model's raw answer", "Amplified diff"],
+        debug_view,
+        set_debug_view,
+    ));
+
     let toasts = adw::ToastOverlay::new();
 
     page.add(&model_group);
     page.add(&motion_group);
     page.add(&comp_group);
+    page.add(&debug_group);
     page.add(&build_status_group(&shm, &toasts));
 
     let header = adw::HeaderBar::new();
