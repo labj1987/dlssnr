@@ -83,6 +83,9 @@ fn cmd_config() -> ExitCode {
     println!("dxvk_vendor={}", cfg.dxvk_vendor);
     println!("dxvk_device={}", cfg.dxvk_device);
     println!("helper_exe={}", install_dir::helper_exe().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".to_string()));
+    for (k, v) in &cfg.settings {
+        println!("{k}={v}");
+    }
     ExitCode::SUCCESS
 }
 

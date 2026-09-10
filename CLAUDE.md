@@ -332,6 +332,81 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   reverting that temporary reduction — the underlying `import_from` logic is what the
   test above actually exercises.
 
+## Compared against a real, installed upstream instance (2026-09-10, on `lordnikon`)
+
+Alex has upstream DLSS5VKLayer's real package (`dlssnr` 0.2.6-1, dpkg) installed on
+another machine (`lordnikon`, RTX 5070, driver 615.71.09) with real Proton/Wine
+runners and a real prior helper log to compare against. Used this to find and fix one
+real gap in the port, without ever touching upstream's source (its installed
+binaries/config/logs were read as *behavior* to compare against, same "shape not
+expression" rule as everywhere else in this project — nothing here was learned by
+reading upstream's C++).
+
+**What was actually wrong, found and fixed**: our GUI's settings only ever lived in
+the SHM mapping (`/tmp/dlssnr-$UID/shm.bin`), which does not survive a reboot —
+`dlssnr_protocol::mapping::open_at` always calls `init_defaults()` on any mapping that
+isn't already valid, with no path to restore prior tuning. Upstream's real,
+installed `~/.config/dlssnr/config.ini` on lordnikon has every tunable persisted as
+`set_<name>=<value>` lines and clearly reloads them (the file had `set_intensity=1`,
+`set_passes=1`, etc. sitting there from a session that ended, presumably, well before
+this one started). Fixed by adding `ShmHeader::persisted_settings`/
+`apply_persisted_setting` (`crates/protocol/src/header.rs`) and a
+`dlssnr_protocol::persist` module that round-trips those through the plain
+`BTreeMap<String,String>` a config file already gets parsed into — `dlssnr-supervisor`'s
+`Config` gained a `settings` field carrying whatever `set_*` lines it doesn't
+otherwise recognize, and `gui/src/shm.rs`'s `bind_float`/`bind_u32`/`bind_bool` now
+take a persistence key name and call through to it on every change.
+`Mapping::freshly_created` is new too (`protocol/src/mapping.rs`) — `Shm::open` only
+applies persisted settings on the call that actually created the mapping, not a warm
+reattach to whatever a currently-running instance already has live. **Verified for
+real, not just by inspection**: `shm::tests::a_setting_changed_through_bind_float_survives_a_simulated_reboot`
+drives the actual production functions end to end (`Shm::open` → `bind_float`'s
+setter → config.ini → delete the SHM file, simulating a reboot → `Shm::open` again →
+confirms the value came back), plus the `persist` module's own round-trip tests in
+`dlssnr-protocol`.
+
+**What was checked and turned out fine, not worth changing**:
+- The helper's caller-identity spoof already hooks the IAT of *two* separate loaded
+  modules (`ngx.rs`'s two `spoof::install()` calls, for the snippet and the core NGX
+  module) — confirmed this matches upstream's real helper log exactly, which shows
+  "GetModuleFileNameW IAT hooked" twice at two different module base addresses during
+  an actual run. Nothing to fix here; good, independent confirmation the port already
+  does this right.
+- `runners.rs`'s Proton scoring (CachyOS > exact-versioned GE-Proton > "GE-Proton
+  Latest" alias > generic) matches the *relative ordering* `dlssnr-runner-probe --json`
+  produced for real against lordnikon's actual `compatibilitytools.d` (scores
+  10000000 / 9011000 / 9000000 respectively) — the exact score values differ (ours
+  weren't designed to match upstream's numbers, just the ranking), and that's fine.
+- The SEH guard really does matter in practice, not just in theory: upstream's real
+  helper log shows the VEH catching a genuine `0xc0000005` access violation mid-
+  `VULKAN_Init_with_ProjectID` and recovering cleanly (synthetic `0x8badf00d` return,
+  then "init OK" right after) rather than crashing the whole helper process. Good
+  validation that `guard.rs`'s whole reason for existing is a real, observed failure
+  mode on real hardware, not a hypothetical one.
+
+**Deliberately not chased further**: upstream's own real run on lordnikon also never
+got DLSS5 NR actually working end-to-end (`VULKAN_CreateFeature(18)` returned
+`0xbad00002`, `DLSSNR.Available=0`, fail-open kicked in) — this machine's
+`nvngx_dlssnr.dll` is a hash-mismatched, signature-invalid file Alex obtained from an
+unofficial source (see the earlier session transcript: verified via `osslsigncode`,
+explicitly declined to use it for anything). That failure is upstream's own
+integration also not working against *that specific file*, not evidence our port's
+NGX call sequence is wrong — there's no legitimate model file on hand to actually
+prove the happy path end-to-end yet on either implementation.
+
+**A rich settings surface exists that neither the GUI nor the SHM header fully expose
+as user-facing controls yet** (upstream's `dlssnr-shmctl settings` lists ~35 tunables;
+our protocol crate already has fields for most of them — `transfer`, `debug_view`,
+`compare_mode`/`compare_split`/`compare_zoom`/`compare_swap`, `colour_mode`,
+`white_point_source`/`white_point_trim`, `apply_model`, `hold_frame`,
+`unlock_passes`, `toggle_key` — but `ui.rs` only ever binds a subset of them to rows).
+Also, upstream ships a separate `dlssnr-shmctl` debug/introspection CLI (raw
+`status`/`set`/`toggle`/`capture` against the live SHM header) that this port has no
+equivalent of. Neither is fixed here — flagging both as real, found gaps for a future
+pass, not implemented now because the settings-persistence fix above was the concrete,
+well-evidenced issue this comparison actually turned up as broken, and both of these
+are scope additions rather than bug fixes.
+
 ## `supervisor` (added 2026-09-09: extracted from `cli` so the GUI can start/stop too)
 
 `crates/cli/src/{paths,config,install_dir,process}.rs` moved verbatim into a new

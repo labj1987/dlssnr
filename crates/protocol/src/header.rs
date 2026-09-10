@@ -439,6 +439,69 @@ impl ShmHeader {
         self.magic.load(Ordering::Relaxed) == SHM_MAGIC && self.version.load(Ordering::Relaxed) == SHM_VERSION
     }
 
+    /// Every setting a user can change from the GUI, as `("name", current bits)`
+    /// pairs -- what [`crate::persist::snapshot`]/[`crate::persist::apply`] round-trip
+    /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
+    /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
+    /// tunable needs to survive a restart -- this is the one list that decides it.
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 21] {
+        [
+            ("enabled", false, self.enabled.load(Ordering::Relaxed)),
+            ("style", false, self.style.load(Ordering::Relaxed)),
+            ("preset", false, self.preset.load(Ordering::Relaxed)),
+            ("intensity", true, self.intensity_bits.load(Ordering::Relaxed)),
+            ("local_tone", true, self.local_tone_bits.load(Ordering::Relaxed)),
+            ("local_structure", true, self.local_structure_bits.load(Ordering::Relaxed)),
+            ("skin_structure", true, self.skin_structure_bits.load(Ordering::Relaxed)),
+            ("sharpness", true, self.sharpness_bits.load(Ordering::Relaxed)),
+            ("auto_mask", false, self.auto_mask.load(Ordering::Relaxed)),
+            ("passes", false, self.passes.load(Ordering::Relaxed)),
+            ("mvec_enabled", false, self.mvec_enabled.load(Ordering::Relaxed)),
+            ("mvec_scale_mode", false, self.mvec_scale_mode.load(Ordering::Relaxed)),
+            ("mvec_quality", false, self.mvec_quality.load(Ordering::Relaxed)),
+            ("composition_bypass", false, self.composition_bypass.load(Ordering::Relaxed)),
+            ("transfer_strength", true, self.transfer_strength_bits.load(Ordering::Relaxed)),
+            ("colour_strength", true, self.colour_strength_bits.load(Ordering::Relaxed)),
+            ("max_ratio", true, self.max_ratio_bits.load(Ordering::Relaxed)),
+            ("working_scale", true, self.working_scale_bits.load(Ordering::Relaxed)),
+            ("scaling_downscaler", false, self.scaling_downscaler.load(Ordering::Relaxed)),
+            ("reversible_mode", false, self.reversible_mode.load(Ordering::Relaxed)),
+            ("hdr_mode", false, self.hdr_mode.load(Ordering::Relaxed)),
+        ]
+    }
+
+    /// Stores one persisted setting back by name (as looked up in a `config.ini`
+    /// `set_<name>=<value>` line) -- `bits` is already the right representation
+    /// (`f32::to_bits()` for the float-valued ones, per [`Self::persisted_settings`]'s
+    /// second field).
+    pub fn apply_persisted_setting(&self, name: &str, bits: u32) {
+        let field = match name {
+            "enabled" => &self.enabled,
+            "style" => &self.style,
+            "preset" => &self.preset,
+            "intensity" => &self.intensity_bits,
+            "local_tone" => &self.local_tone_bits,
+            "local_structure" => &self.local_structure_bits,
+            "skin_structure" => &self.skin_structure_bits,
+            "sharpness" => &self.sharpness_bits,
+            "auto_mask" => &self.auto_mask,
+            "passes" => &self.passes,
+            "mvec_enabled" => &self.mvec_enabled,
+            "mvec_scale_mode" => &self.mvec_scale_mode,
+            "mvec_quality" => &self.mvec_quality,
+            "composition_bypass" => &self.composition_bypass,
+            "transfer_strength" => &self.transfer_strength_bits,
+            "colour_strength" => &self.colour_strength_bits,
+            "max_ratio" => &self.max_ratio_bits,
+            "working_scale" => &self.working_scale_bits,
+            "scaling_downscaler" => &self.scaling_downscaler,
+            "reversible_mode" => &self.reversible_mode,
+            "hdr_mode" => &self.hdr_mode,
+            _ => return,
+        };
+        field.store(bits, Ordering::Relaxed);
+    }
+
     pub fn pass_ceiling(&self) -> u32 {
         if self.unlock_passes.load(Ordering::Relaxed) != 0 {
             MAX_PASSES as u32

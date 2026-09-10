@@ -32,6 +32,7 @@ mod header;
 #[cfg(unix)]
 pub mod mapping;
 mod path;
+pub mod persist;
 
 pub use header::{load64, store64, PassControl, PassTuning, ShmHeader};
 pub use path::{shm_default_path, shm_runtime_dir};

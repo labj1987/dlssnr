@@ -18,6 +18,12 @@ pub struct Config {
     pub log: String,
     pub dxvk_vendor: String,
     pub dxvk_device: String,
+    /// Every `set_<name>=<value>` line -- the model/composition tuning
+    /// `dlssnr_protocol::persist` round-trips through here so it survives a reboot
+    /// (unlike the SHM mapping itself, which lives under `/tmp`). Kept as raw
+    /// strings rather than parsed here: this crate doesn't need to know what any of
+    /// these settings mean, only that they persist.
+    pub settings: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -43,6 +49,7 @@ impl Config {
             log: map.remove("log").unwrap_or_default(),
             dxvk_vendor: map.remove("dxvk_vendor").unwrap_or_default(),
             dxvk_device: map.remove("dxvk_device").unwrap_or_default(),
+            settings: BTreeMap::new(),
         };
         // A config written by an older build (or a stray manual edit) pinning the
         // mapping to $XDG_RUNTIME_DIR is exactly the path a Steam game cannot see
@@ -59,15 +66,23 @@ impl Config {
         if cfg.log.is_empty() {
             cfg.log = paths::log_file();
         }
+        // Whatever's left in `map` after pulling out the known fields above is every
+        // `set_*` tuning line (plus, harmlessly, anything else an older/newer build
+        // or a stray manual edit left behind) -- kept rather than dropped so `save()`
+        // round-trips it.
+        cfg.settings = map;
         cfg
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         paths::ensure_dirs()?;
-        let text = format!(
+        let mut text = format!(
             "runner_type={}\nrunner_path={}\nbinaries={}\nshm={}\nlog={}\ndxvk_vendor={}\ndxvk_device={}\n",
             self.runner_type, self.runner_path, self.binaries, self.shm, self.log, self.dxvk_vendor, self.dxvk_device,
         );
+        for (k, v) in &self.settings {
+            text.push_str(&format!("{k}={v}\n"));
+        }
         std::fs::write(paths::config_file(), text)
     }
 }

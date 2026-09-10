@@ -17,6 +17,12 @@ use crate::{shm_default_path, shm_total_bytes, ShmHeader, HEADER_BYTES};
 pub struct Mapping {
     _fd: OwnedFd,
     header: *mut ShmHeader,
+    /// Whether this call is what created the mapping (no valid existing header to
+    /// reattach to) rather than reattaching to one an already-running instance owns.
+    /// A caller that persists settings to `config.ini` (the GUI) uses this to know
+    /// when it's safe to apply persisted overrides -- doing that on a warm reattach
+    /// would fight whatever the already-running instance currently has live.
+    pub freshly_created: bool,
 }
 
 // SAFETY: same reasoning as `ShmHeader` itself being `Sync` -- every access through
@@ -43,7 +49,7 @@ pub fn open() -> Option<Mapping> {
     open_at(&path)
 }
 
-fn open_at(path: &str) -> Option<Mapping> {
+pub(crate) fn open_at(path: &str) -> Option<Mapping> {
     if let Some(slash) = path.rfind('/') {
         let dir = &path[..slash];
         if !dir.is_empty() {
@@ -83,11 +89,12 @@ fn open_at(path: &str) -> Option<Mapping> {
     let header = map.cast::<ShmHeader>();
     // SAFETY: just mapped above, `HEADER_BYTES` is large enough for `ShmHeader`.
     let hdr = unsafe { &*header };
-    if !hdr.is_valid() {
+    let freshly_created = !hdr.is_valid();
+    if freshly_created {
         hdr.init_defaults();
     }
 
-    Some(Mapping { _fd: fd, header })
+    Some(Mapping { _fd: fd, header, freshly_created })
 }
 
 #[cfg(test)]

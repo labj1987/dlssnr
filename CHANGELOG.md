@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 — 2026-09-10
+
+- Settings changed in the GUI now survive a reboot. Previously they lived only in the
+  SHM mapping under `/tmp`, which doesn't persist — found by comparing against a real,
+  installed upstream instance's `config.ini`, which does persist them.
+
 ## 0.1.2 — 2026-09-09
 
 - Fixes a real crash found on first-ever real-hardware testing: `create_feature_at()`
