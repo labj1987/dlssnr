@@ -270,8 +270,62 @@ Real cross-compiling + linking against the mingw CRT is now verified working (se
   is now a thin binary wrapper around the `dlssnr_helper` library crate. Keep this
   split; it's what makes the Wine-based example tests above possible at all.
 
-## CRITICAL, confirmed, NOT YET FIXED: the layer crashes on its own real activation
-## path (2026-09-10, `lordnikon`)
+## FIXED (2026-09-10, v0.1.6): the layer crashed on its own real activation path
+
+**Root cause found and fixed.** `vulkan_layer::Global::create_instance`'s default
+fallback path (taken whenever `GlobalHooks::create_instance` returns `Unhandled`, which
+is what `StubGlobalHooks` — what this crate used before this fix — always does) calls
+`ash::vk::EntryFnV1_0::load`, which eagerly resolves *all three* Vulkan 1.0 global entry
+points (`vkCreateInstance`, `vkEnumerateInstanceExtensionProperties`,
+`vkEnumerateInstanceLayerProperties`) through the chained, `VK_NULL_HANDLE`-instance
+`vkGetInstanceProcAddr` — even though a layer that only calls `entry.create_instance`
+afterward (as this one does) never uses the other two. Resolving
+`vkEnumerateInstanceExtensionProperties` that way segfaults inside
+`libVkLayer_MESA_device_select.so` on this dev machine's Mesa build, 100% of the time;
+resolving `vkCreateInstance` through the exact same chained pointer, one field earlier,
+does not. **Confirmed via `gdb` this is not a dlssnr-specific bug at all**: building and
+running `vulkan-layer`'s own pristine, unmodified `hello-world` example under the
+identical implicit-activation scenario in this same sandbox produces the *exact same*
+crash and backtrace (`libVkLayer_MESA_device_select.so` → `EntryFnV1_0::load` closure →
+`vulkan_layer::Global::create_instance`, `vulkan-layer/src/lib.rs:710`/`716`) — this is a
+bug in the pinned `vulkan-layer` commit's interaction with this Mesa build (worth filing
+upstream at some point, but not blocking — see the fix below), not anything this
+project's own code did wrong.
+
+**The fix** (`crates/layer/src/lib.rs`): implemented `GlobalHooks::create_instance`
+ourselves via a new `DlssnrGlobalHooks` type (replacing `StubGlobalHooks`), resolving
+only `vkCreateInstance` through the chained `pfnNextGetInstanceProcAddr` and calling it
+directly — the same pattern `vulkan-layer`'s own doc-comment example for a layer that
+needs to intercept `vkCreateInstance` shows. This never makes the
+`vkEnumerateInstanceExtensionProperties`/`vkEnumerateInstanceLayerProperties` queries
+that crash, since this layer never needed them in the first place.
+
+**Verified fixed, for real, not just compiled**:
+- Locally (this sandbox has the identical `libVkLayer_MESA_device_select.so` present):
+  5/5 clean runs of `crates/layer/examples/smoke` under real implicit activation
+  (`VK_ADD_IMPLICIT_LAYER_PATH` + `VKLayer_DLSS5=1`, no `VK_INSTANCE_LAYERS`) — exit 0,
+  full instance/device creation, every time. Previously 100% reproducible crash, 0/5.
+- On `lordnikon` (real GPU/driver, the machine the original crash was found and
+  bisected on): 3/3 clean `vkcube --width 1920 --height 1080` runs under the exact
+  repro command line from the previous investigation
+  (`VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`) — each ran the full
+  8-second `timeout` (exit 124, not a crash), with the layer log showing real capture
+  and shared-memory round trips happening every frame (`answered=false` is expected —
+  no helper was running for this test, which fails open correctly, same as always).
+- Full `cargo test` (workspace, all 4 native crates) stays green: 36 tests passed, 0
+  failed. Both `scripts/smoke-test.sh` (explicit activation, the crate's existing
+  regression test) and the mingw cross-compile check for `helper` still pass —
+  confirming this change didn't regress either path.
+
+**What this unblocks**: this was "the single most important thing to fix in this
+project" as of 0.1.5 — nothing past `vkCreateInstance` could work while it held, on any
+machine with Mesa's `device_select` present (the default on this dev setup and common
+on real Linux desktops generally). The full bisection history that led here is kept
+below for the record — it's what ruled out everything else first and narrowed this down
+to "something about how we call the next layer during instance creation," which is
+exactly where the real bug turned out to be.
+
+### Original bisection (kept for the record; the crash above is now fixed)
 
 **Upstream, for the record, fully works.** With a real, legitimately-signed
 `nvngx_dlssnr.dll` in place (verified via `osslsigncode` — NVIDIA Corporation,

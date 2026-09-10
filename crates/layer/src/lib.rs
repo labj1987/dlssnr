@@ -39,7 +39,10 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use once_cell::sync::Lazy;
-use vulkan_layer::{declare_introspection_queries, Global, Layer, LayerManifest, StubGlobalHooks, StubInstanceInfo};
+use vulkan_layer::{
+    auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, Layer, LayerManifest,
+    LayerResult, StubInstanceInfo, VkLayerInstanceLink,
+};
 
 use device::DlssnrDeviceInfo;
 
@@ -69,11 +72,61 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+/// Works around a crash inside Mesa's `device_select` implicit layer, confirmed
+/// reproducible even with `vulkan-layer`'s own pristine `hello-world` example under
+/// implicit activation on this machine's Mesa build (see `CLAUDE.md`'s "CRITICAL,
+/// confirmed" section for the full bisection) -- so this is a bug in the interaction
+/// between the pinned `vulkan-layer` commit and this Mesa build, not anything specific
+/// to this crate. `vulkan_layer::Global::create_instance`'s default fallback path
+/// (taken whenever `GlobalHooks::create_instance` is `Unhandled`) eagerly resolves all
+/// three Vulkan 1.0 global entry points -- `vkCreateInstance`,
+/// `vkEnumerateInstanceExtensionProperties`, `vkEnumerateInstanceLayerProperties` --
+/// through the chained, `VK_NULL_HANDLE`-instance `vkGetInstanceProcAddr`
+/// (`ash::vk::EntryFnV1_0::load`), even though only `vkCreateInstance` is ever actually
+/// called afterward. Resolving `vkEnumerateInstanceExtensionProperties` that way
+/// segfaults inside `libVkLayer_MESA_device_select.so` 100% of the time (confirmed via
+/// `gdb`: `vkCreateInstance` resolves fine through the exact same chained pointer,
+/// `vkEnumerateInstanceExtensionProperties` right after it does not). Hooking
+/// `create_instance` ourselves and resolving only the one entry point this layer
+/// actually needs avoids ever making the query that crashes.
 #[derive(Default)]
-struct DlssnrLayer(StubGlobalHooks);
+struct DlssnrGlobalHooks;
+
+#[auto_globalhooksinfo_impl]
+impl GlobalHooks for DlssnrGlobalHooks {
+    fn create_instance(
+        &self,
+        create_info: &vk::InstanceCreateInfo,
+        layer_instance_link: &VkLayerInstanceLink,
+        allocator: Option<&vk::AllocationCallbacks>,
+        p_instance: *mut vk::Instance,
+    ) -> LayerResult<ash::prelude::VkResult<()>> {
+        // SAFETY: `layer_instance_link.pfnNextGetInstanceProcAddr` is the loader- or
+        // next-layer-supplied chained `vkGetInstanceProcAddr`, valid for the duration of
+        // this call; `VK_NULL_HANDLE` + a global-command name is the spec-mandated way
+        // to query it before an instance exists.
+        let create_instance = unsafe {
+            (layer_instance_link.pfnNextGetInstanceProcAddr)(vk::Instance::null(), c"vkCreateInstance".as_ptr())
+        };
+        let create_instance: vk::PFN_vkCreateInstance = match create_instance {
+            // SAFETY: a non-null `vkGetInstanceProcAddr(NULL, "vkCreateInstance")` result
+            // is guaranteed by the Vulkan spec to have this exact signature.
+            Some(fp) => unsafe { std::mem::transmute(fp) },
+            None => return LayerResult::Handled(Err(vk::Result::ERROR_INITIALIZATION_FAILED)),
+        };
+        let allocator = allocator.map_or(std::ptr::null(), |allocator| allocator as *const _);
+        // SAFETY: `create_info`/`p_instance` are the same, still-valid pointers the
+        // framework was called with; `allocator` is either null or that same valid
+        // pointer.
+        LayerResult::Handled(unsafe { create_instance(create_info, allocator, p_instance) }.result())
+    }
+}
+
+#[derive(Default)]
+struct DlssnrLayer(DlssnrGlobalHooks);
 
 impl Layer for DlssnrLayer {
-    type GlobalHooksInfo = StubGlobalHooks;
+    type GlobalHooksInfo = DlssnrGlobalHooks;
     type InstanceInfo = StubInstanceInfo;
     type DeviceInfo = DlssnrDeviceInfo;
     type InstanceInfoContainer = StubInstanceInfo;

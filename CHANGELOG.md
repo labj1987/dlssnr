@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.6 — 2026-09-10
+
+- **Fixed the critical layer crash documented in 0.1.5**: `VK_LAYER_dlssnr_neural`
+  segfaulted 100% of the time under real, implicit activation (`VKLayer_DLSS5=1`) in
+  the presence of Mesa's `device_select` implicit layer. Root cause, found by
+  reproducing the crash locally against Google's own pristine, unmodified
+  `vulkan-layer` `hello-world` example (same crash, same backtrace — proving this was
+  never a dlssnr-specific bug): `vulkan_layer::Global::create_instance`'s default
+  fallback path eagerly resolves all three Vulkan 1.0 global entry points
+  (`vkCreateInstance`/`vkEnumerateInstanceExtensionProperties`/
+  `vkEnumerateInstanceLayerProperties`) through the chained, `VK_NULL_HANDLE`-instance
+  `vkGetInstanceProcAddr`, even though a layer that doesn't hook those extra two never
+  calls them afterward. Resolving `vkEnumerateInstanceExtensionProperties` that way
+  segfaults inside `libVkLayer_MESA_device_select.so` on this Mesa build 100% of the
+  time; `vkCreateInstance` resolves fine through the exact same chained pointer right
+  before it. Worked around by implementing `GlobalHooks::create_instance` ourselves
+  (`crates/layer/src/lib.rs`'s new `DlssnrGlobalHooks`) and resolving only the one
+  entry point this layer actually needs, never making the query that crashes.
+  Verified fixed: 5/5 clean runs locally (this sandbox has the identical Mesa
+  `device_select` present) and 3/3 clean real `vkcube` runs on `lordnikon` (real
+  GPU/driver, the machine the original crash was found on) — capturing and
+  round-tripping real frames the whole time, no crash. Full workspace test suite and
+  both smoke tests (explicit and implicit activation) still green.
+
 ## 0.1.5 — 2026-09-10
 
 - No fix in this release — documenting a critical, confirmed bug found while testing
