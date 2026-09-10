@@ -1,12 +1,24 @@
 //! Milestone 4 phase B: the real per-frame resources `EvaluateFeature` needs -- Color
-//! (the proxy the layer captured), Output (where the model writes its answer), and
-//! MVec (motion vectors) -- and the upload/evaluate/download sequence that binds them.
+//! (the proxy the layer captured), Output (where the model writes its answer), MVec
+//! (motion vectors), and Depth -- and the upload/evaluate/download sequence that binds
+//! them.
 //!
 //! MVec scope: no real optical flow yet (`VK_NV_optical_flow`, mentioned in the
 //! README, isn't wired up anywhere in this crate) -- this always hands the model an
 //! all-zero MVec image, i.e. "no motion", a safe default rather than nothing at all.
 //! Wiring up real synthetic motion vectors is separate follow-up work, not required
 //! for the create/evaluate/read-back plumbing this module proves.
+//!
+//! Depth scope, added 2026-09-10: `DLSSNR.Depth`/`DLSSNR.DepthInverted` are real,
+//! confirmed-present parameters (`strings` against the real `nvngx_dlssnr.dll` turns up
+//! `DLSSNR: EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p ...`, naming exactly
+//! four resources) this crate never bound before -- a real, plausible cause of a first
+//! real visual check (see `CLAUDE.md`) turning up a solid-white `EvaluateFeature`
+//! answer despite a `0x1` success code. Like MVec, there is no real depth buffer to
+//! give it yet (`dlssnr_layer::capture` only ever captures the presented color image),
+//! so this hands the model a constant, synthetic "far plane, no real depth" value --
+//! an honest stand-in, not a real per-pixel depth buffer, same spirit as MVec's
+//! all-zero placeholder.
 //!
 //! Same staging-copy discipline as `dlssnr_layer::capture`: images are populated via
 //! an explicit host-visible-buffer upload/download, not a zero-copy import.
@@ -32,6 +44,9 @@ pub struct FrameResources {
     mvec_image: vk::Image,
     mvec_view: vk::ImageView,
     mvec_memory: vk::DeviceMemory,
+    depth_image: vk::Image,
+    depth_view: vk::ImageView,
+    depth_memory: vk::DeviceMemory,
 
     /// Host-visible staging, sized to the larger of upload (Color/MVec) or download
     /// (Output) -- one buffer, reused sequentially, same simplification
@@ -39,6 +54,14 @@ pub struct FrameResources {
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_ptr: *mut u8,
+
+    /// Whether `evaluate` has run at least once yet -- see `DLSSNR.Reset`'s own
+    /// handling in `evaluate` for why this matters. `Cell`, not a plain `bool`:
+    /// `evaluate` takes `&self` (this whole struct is a fixed, per-size-class set of
+    /// GPU resources shared across every frame at that size, not something that needs
+    /// `&mut` to use), so this is the one piece of real per-frame state that needs
+    /// interior mutability to track from there.
+    reset_done: std::cell::Cell<bool>,
 }
 
 // SAFETY: every field is a plain Vulkan handle or a `vkMapMemory` pointer into memory
@@ -48,6 +71,16 @@ unsafe impl Send for FrameResources {}
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+// `DLSSNR.Depth`/`DLSSNR.DepthInverted` exist in the real DLL's own string table
+// (`EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p` -- confirmed present via
+// `strings` against the real binary, 2026-09-10) but were never bound here before --
+// this crate had no depth buffer to give it and the real capture path
+// (`dlssnr_layer::capture`) only ever captures the presented color image, never a
+// depth attachment. A color-aspect (not a real `D32_SFLOAT` depth-aspect image, to
+// avoid the different layout/aspect-mask rules those need) constant-far-plane image is
+// a synthetic stand-in -- "no usable depth" as honestly as this crate can currently
+// say it, not a real per-pixel depth buffer. See this module's own doc comment.
+const DEPTH_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 
 fn find_memory_type(props: &vk::PhysicalDeviceMemoryProperties, type_bits: u32, wanted: vk::MemoryPropertyFlags) -> Option<u32> {
     (0..props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0 && props.memory_types[i as usize].property_flags.contains(wanted))
@@ -161,6 +194,14 @@ impl FrameResources {
             MVEC_FORMAT,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
         )?;
+        let (depth_image, depth_view, depth_memory) = create_image(
+            device,
+            &mem_props,
+            width,
+            height,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        )?;
 
         let pool_info =
             vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -217,9 +258,13 @@ impl FrameResources {
             mvec_image,
             mvec_view,
             mvec_memory,
+            depth_image,
+            depth_view,
+            depth_memory,
             staging_buffer,
             staging_memory,
             staging_ptr,
+            reset_done: std::cell::Cell::new(false),
         })
     }
 
@@ -259,12 +304,15 @@ impl FrameResources {
         let color_info = self.resource_info(self.color_view, self.color_image, COLOR_FORMAT);
         let output_info = self.resource_info(self.output_view, self.output_image, COLOR_FORMAT);
         let mvec_info = self.resource_info(self.mvec_view, self.mvec_image, MVEC_FORMAT);
+        let depth_info = self.resource_info(self.depth_view, self.depth_image, DEPTH_FORMAT);
         // Parameter names guessed "for shape" from the same `DLSSNR.*` convention
         // `crates/helper/src/ngx.rs::create_feature_at` already uses for the scalar
         // parameters -- no public spec exists for this fictional feature's resource
         // bindings any more than for its scalars. Wrong names/slots here fail via the
         // guard below, not a crash, exactly like a wrong `CreateFeature` parameter did
-        // before the v0.1.2 fix.
+        // before the v0.1.2 fix. `Depth`/`DepthInverted` and every `*Subrect*` name
+        // below are confirmed present in the real DLL's own string table (`strings`,
+        // 2026-09-10) -- not new guesses, the first ones checked against real evidence.
         let name = |n: &str| std::ffi::CString::new(n).unwrap();
         // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
         unsafe {
@@ -274,6 +322,31 @@ impl FrameResources {
             abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
             let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
+            let mut depth = NgxResourceVk::from_image_view(depth_info, false);
+            abi::ngx_set_ptr(params, name("DLSSNR.Depth").as_ptr(), std::ptr::from_mut(&mut depth).cast());
+            // Standard, non-reversed-Z convention (near=0, far=1) -- matches the
+            // constant 1.0 ("far") the depth image is cleared to in `run_transfer`.
+            abi::ngx_set_u32(params, name("DLSSNR.DepthInverted").as_ptr(), 0);
+
+            // Every resource is the full frame at (0,0) -- no sub-rect windowing is
+            // used anywhere in this crate yet.
+            for resource in ["Color", "Output", "MVec", "Depth"] {
+                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseX")).as_ptr(), 0);
+                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseY")).as_ptr(), 0);
+                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectWidth")).as_ptr(), self.width);
+                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectHeight")).as_ptr(), self.height);
+            }
+            // `ngx::create_feature_at` sets `DLSSNR.Reset = 1` once, at creation, and
+            // this crate never touched it again before now -- every single evaluate
+            // call therefore told the model "no valid history, this is frame one" for
+            // the life of the feature, a real, plausible cause of a first real visual
+            // check (see CLAUDE.md) finding every frame produces the exact same
+            // (solid white) output regardless of input: a temporal model's real,
+            // history-dependent answer would only ever appear from the second frame
+            // set to `Reset = 0` onward, which never happened before this. `1` only on
+            // this feature's actual first `evaluate` call, `0` on every one after.
+            let reset = u32::from(!self.reset_done.replace(true));
+            abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
 
             let (result, seh) = crate::guard::guarded(
                 || {
@@ -378,7 +451,14 @@ impl FrameResources {
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::TRANSFER_WRITE,
                 );
-                // SAFETY: `self.cmd` is recording; both images were just created
+                let to_dst_depth = img_barrier(
+                    self.depth_image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                // SAFETY: `self.cmd` is recording; all three images were just created
                 // (`UNDEFINED` matches their real, never-yet-transitioned layout).
                 unsafe {
                     device.cmd_pipeline_barrier(
@@ -388,7 +468,7 @@ impl FrameResources {
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
-                        &[to_dst_color, to_dst_mvec],
+                        &[to_dst_color, to_dst_mvec, to_dst_depth],
                     );
                     device.cmd_copy_buffer_to_image(
                         self.cmd,
@@ -406,6 +486,17 @@ impl FrameResources {
                         &vk::ClearColorValue { float32: [0.0; 4] },
                         &[sub(vk::ImageAspectFlags::COLOR)],
                     );
+                    // Depth: no real depth buffer captured yet either (see module doc
+                    // comment) -- a constant 1.0 ("far plane", standard non-reversed-Z
+                    // convention, matching `DLSSNR.DepthInverted = 0` below) rather
+                    // than leaving it undefined.
+                    device.cmd_clear_color_image(
+                        self.cmd,
+                        self.depth_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
+                        &[sub(vk::ImageAspectFlags::COLOR)],
+                    );
                     let to_shader = img_barrier(
                         self.color_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -415,6 +506,13 @@ impl FrameResources {
                     );
                     let mvec_to_shader = img_barrier(
                         self.mvec_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    );
+                    let depth_to_shader = img_barrier(
+                        self.depth_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                         vk::AccessFlags::TRANSFER_WRITE,
@@ -434,7 +532,7 @@ impl FrameResources {
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
-                        &[to_shader, mvec_to_shader, output_to_general],
+                        &[to_shader, mvec_to_shader, depth_to_shader, output_to_general],
                     );
                 }
             }
@@ -505,6 +603,9 @@ impl FrameResources {
             device.destroy_image_view(self.mvec_view, None);
             device.destroy_image(self.mvec_image, None);
             device.free_memory(self.mvec_memory, None);
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth_image, None);
+            device.free_memory(self.depth_memory, None);
             device.destroy_command_pool(self.pool, None);
         }
     }

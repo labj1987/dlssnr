@@ -21,3 +21,7 @@ ash = "=0.37.3"
 vulkan-layer = { git = "https://github.com/google/vk-layer-for-rust", rev = "102d87cd9781c045b232e77eef198eed75ce8a8c" }
 once_cell = "1"
 libc = "0.2"
+# For real ShmHeader::capture_request support (see src/dump.rs) -- a pure-Rust,
+# encode-only PNG writer is the minimal real dependency for "write these RGBA8 bytes
+# out as a file a human can actually look at", not something worth hand-rolling.
+png = "0.17"

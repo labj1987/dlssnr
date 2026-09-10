@@ -92,6 +92,16 @@ impl ShmClient {
         hdr.helper_state.load(Ordering::Relaxed) == helper_state::MODEL_FAILED
     }
 
+    /// Consumes a pending "dump one matched before/after frame pair" request (see
+    /// `dlssnr_protocol::header::ShmHeader::capture_request`'s own doc comment) --
+    /// `true` at most once per request, since this resets it to 0 in the same atomic
+    /// operation, so the very next present doesn't dump again for a request that was
+    /// already served.
+    pub fn take_capture_request(&self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        hdr.capture_request.swap(0, Ordering::Relaxed) != 0
+    }
+
     /// The settings `composition::apply::apply_rgba8` needs, read fresh every frame
     /// (each is a single atomic load) so a live GUI change takes effect on the very
     /// next present rather than needing a restart. `None` before the mapping is open.

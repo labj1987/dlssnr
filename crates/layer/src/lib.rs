@@ -30,6 +30,7 @@
 mod capture;
 mod composition;
 mod device;
+mod dump;
 mod logging;
 mod shm;
 mod swapchain;

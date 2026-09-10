@@ -166,12 +166,29 @@ fn main() {
 /// enabled them is the leading suspect for why `CreateFeature` behaved inconsistently
 /// (a clean reject one run, an actual C++ exception the next) even after every
 /// parameter this session could confirm from the same binary was added.
+///
+/// **2026-09-10 correction**: the reference binary `strings` was originally run
+/// against was upstream's *native Linux* helper (per this project's own architecture,
+/// upstream's own eventual roadmap target -- see the crate-level doc comment) --
+/// `VK_EXT_external_memory_dma_buf`/`VK_KHR_external_memory_fd` are POSIX-specific
+/// external-memory handle types that a real Linux Vulkan ICD legitimately exposes and
+/// that reference binary legitimately used. `dlssnr_helper.exe` is not that: it is a
+/// Windows binary running under Wine/Proton (this crate's current, documented, interim
+/// architecture), and Wine's Vulkan implementation for Windows guest apps exposes the
+/// Windows-shaped `VK_KHR_external_memory_win32` handle type, never the Linux `_fd`
+/// ones -- requesting the Linux-specific pair here could never succeed no matter what
+/// the real driver supports, a platform mismatch inherited from copying the reference
+/// list without adjusting for which binary actually needed which handles. Found while
+/// investigating a real, confirmed-white `EvaluateFeature` answer (see `CLAUDE.md`) --
+/// this DLL performs real CUDA-Vulkan interop internally (`cuSurfObjectGetResourceDesc`
+/// et al., confirmed via `strings` on the real DLL itself), which is exactly the kind
+/// of external-memory-dependent operation a missing win32 handle type would degrade.
 const WANTED_DEVICE_EXTENSIONS: &[&str] = &[
     "VK_EXT_debug_utils",
-    "VK_EXT_external_memory_dma_buf",
     "VK_EXT_external_memory_host",
     "VK_KHR_buffer_device_address",
-    "VK_KHR_external_memory_fd",
+    "VK_KHR_external_memory",
+    "VK_KHR_external_memory_win32",
     "VK_KHR_push_descriptor",
     "VK_NV_optical_flow",
     "VK_NVX_binary_import",

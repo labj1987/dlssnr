@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.9 — 2026-09-10
+
+- Real `ShmHeader::capture_request` support (`crates/layer/src/dump.rs`, new):
+  writes a matched before/after PNG pair on request. Plus
+  `crates/protocol/examples/trigger_capture.rs`, a small manual tool to trigger one
+  (and optionally set `debug_view`) against a running instance from the outside.
+- Three real bugs found (via `strings` against the real `nvngx_dlssnr.dll`) and fixed
+  in the helper's NGX evaluation, all independently justified, none the actual cause
+  of what they were found while chasing (see below): `DLSSNR.Depth`/`DepthInverted`
+  and every resource's `*Subrect*` scalar were never bound; `DLSSNR.Reset` was set
+  once at creation and never toggled to 0 for subsequent frames; the device extension
+  list was copied from a native-Linux reference binary's own strings output without
+  adjusting for this crate's actual Windows/Wine platform
+  (`VK_EXT_external_memory_dma_buf`/`VK_KHR_external_memory_fd` -> `VK_KHR_external_memory`/
+  `VK_KHR_external_memory_win32`; device extension count went 6/9 -> 8/9).
+- Found and fixed the actual bug behind an initially-alarming solid-white dumped model
+  answer: it was this session's own new PNG dump tool passing through a real answer's
+  alpha channel (0 across the whole image) unmodified, which a PNG viewer renders as
+  blank/transparent — not a broken model output. A real opaque-composite-mode present
+  never reads alpha at all, so this could never have affected an actual displayed
+  frame. Fixed by forcing alpha to 255 before encoding.
+- **First real visual confirmation the full pipeline produces correct output**: a
+  pixel diff between a real captured frame and its real composited answer shows a
+  mean per-channel difference of ~17/255 across 100% of sampled pixels — real,
+  structured work, not a no-op or garbage. Full writeup in CLAUDE.md.
+
 ## 0.1.8 — 2026-09-10
 
 - **This project's own composition math now actually reaches the presented frame**

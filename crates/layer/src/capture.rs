@@ -395,6 +395,20 @@ pub unsafe fn run(
     }
     crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
 
+    // Real `ShmHeader::capture_request` support: dump this frame's original and
+    // final (post-composition, if any ran above) bytes to disk. Checked regardless of
+    // `answered`/`proxy_format` so a request during a fail-open frame still produces a
+    // (identical) matched pair rather than silently doing nothing -- `write_pair`
+    // itself is the only place that would need to special-case a format it can't
+    // encode, and today it always gets `RGBA8` bytes either way.
+    if shm.take_capture_request() && proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8 {
+        // SAFETY: same reasoning as every other read of `r.ptr` in this function --
+        // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
+        // hasn't started overwriting it yet.
+        let current = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
+        crate::dump::write_pair(&original, current, width, height);
+    }
+
     // Stage 2: staging buffer (now holding the answer, if there was one -- otherwise
     // still the captured bytes) -> image.
     // SAFETY: `r.cmd` was ended above; the pool it came from allows re-recording.

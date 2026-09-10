@@ -495,6 +495,80 @@ integration can produce a real, successful, repeated model evaluation at all, on
 first machine that's ever had a legitimate DLL to test it against. That question is now
 answered yes.
 
+## First confirmed *correct visual output*, plus three real bugs found and fixed along
+## the way, plus one important false alarm (2026-09-10, `lordnikon`)
+
+A real dump of `EvaluateFeature`'s actual answer (via the new `ShmHeader::capture_request`
+support, see `composition::apply`'s section below) initially showed a solid white
+image with no visible structure at all -- alarming, since the success codes above only
+prove the API call succeeded, not that the pixels it produced are meaningful. Chasing
+that down the wrong way first, then the right way, is worth recording in full:
+
+**Three real bugs found and fixed, via `strings` against the real `nvngx_dlssnr.dll`
+(never upstream's source -- same "shape not expression" rule as everywhere else in this
+project) and plain reasoning about temporal state, none of which turned out to be the
+actual cause of the white image, but all three genuine, independently-justified
+correctness fixes worth keeping regardless**:
+1. **`DLSSNR.Depth`/`DLSSNR.DepthInverted` were never bound.** `strings` on the real DLL
+   turns up `DLSSNR: EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p ...` -- a real,
+   confirmed-present fourth resource this crate never supplied. Fixed
+   (`crates/helper/src/frame.rs`) with a synthetic, constant-"far-plane" depth image
+   (no real depth buffer is captured by `dlssnr_layer::capture` yet, same honest
+   stand-in status as MVec's all-zero motion), `DepthInverted = 0` (standard,
+   non-reversed convention). Also added every resource's `*SubrectBaseX/Y/Width/Height`
+   scalar (also confirmed present via `strings`), set to the full frame -- previously
+   never set at all.
+2. **`DLSSNR.Reset` was set to `1` once at feature creation and never touched again.**
+   Every single `EvaluateFeature` call for the life of the feature was therefore
+   telling the model "no valid history, this is frame one" -- plausible, on its own,
+   for a temporal model to have a degenerate or placeholder first-frame output. Fixed
+   (`frame.rs`'s new `reset_done: Cell<bool>`): `1` only on the feature's real first
+   `evaluate` call, `0` on every one after.
+3. **The device's `WANTED_DEVICE_EXTENSIONS` list (`main.rs`) was copied from a native
+   Linux reference binary's own `strings` output without adjusting for platform.**
+   `VK_EXT_external_memory_dma_buf`/`VK_KHR_external_memory_fd` are POSIX-specific and
+   could never be exposed by a Windows Vulkan device even under perfect Wine
+   emulation -- `dlssnr_helper.exe` is a Windows binary (this project's current,
+   documented, interim architecture), so the correct ask is
+   `VK_KHR_external_memory`/`VK_KHR_external_memory_win32`. Confirmed real: device
+   extension count went from 6/9 to 8/9 once corrected, with `VK_KHR_external_memory_win32`
+   actually present and enabled. Plausible relevance: the real DLL performs genuine
+   CUDA-Vulkan interop internally (`cuSurfObjectGetResourceDesc` and similar, confirmed
+   via the same `strings` pass), which is exactly the kind of operation a missing
+   external-memory handle type would degrade.
+
+**None of the three fixed it. The actual cause was a bug in this session's own new
+diagnostic tool, not the pipeline**: `crates/layer/src/dump.rs`'s PNG writer passed the
+`Output`/answer bytes through with whatever alpha channel they actually had -- which
+turned out to be `0` (fully transparent) across the entire image, while the RGB channels
+held real, structured, non-uniform data the whole time (confirmed by inspecting actual
+pixel values, not just the rendered PNG: real varied colors like `(35,35,35)`/`(1,35,41)`,
+not `(255,255,255)`). A PNG viewer renders zero-alpha content as blank/white against its
+own background, which looks exactly like -- and was genuinely mistaken here for -- a
+broken, degenerate model answer. **A real opaque-composite-mode swapchain present
+(what every normal game uses, including `vkcube`) never reads the alpha channel at
+all**, so this was never a bug that could have affected an actual displayed frame --
+purely an artifact of how the new debug-dump tool chose to write its output file. Fixed
+by forcing alpha to `255` before encoding (`write_png`'s own doc comment explains why).
+
+**With that fixed, real visual confirmation**: the composited output is visually
+near-identical to the original captured frame for this specific test scene (a plain,
+correctly-exposed SDR rotating cube, no blown highlights) -- which is the *correct*
+expected result for `upgrade_tone_map`'s own algorithm on content like this, not a sign
+of nothing happening. Confirmed the model is doing real, non-trivial, structured work
+regardless: a pixel diff between the original and composited PNGs shows a mean
+per-channel difference of ~17/255 (max 65/255) across **100% of sampled pixels** --
+substantial, structured change everywhere, not rounding noise and not a no-op. This is
+the first time this project has visually confirmed its real, end-to-end,
+capture-to-composition pipeline produces correct, coherent, non-degenerate output
+against a real model on real hardware, not just "the API calls returned success."
+
+**What this still doesn't prove**: whether the result is *better* than the original in
+any measurable way (no reference/ground-truth comparison exists to score against), and
+everything the "First confirmed neural-rendering success" section above already listed
+as unaffected (real optical flow, a scene with actual blown highlights to exercise the
+headroom-recovery branch) is still unaffected by this pass either.
+
 ## Composition math now actually reaches the frame (2026-09-10) -- CPU path, real
 ## measured performance cost, real measured fix
 
