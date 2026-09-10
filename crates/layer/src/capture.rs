@@ -9,12 +9,15 @@
 //! just not zero-copy; importing the mapping directly as device memory is a later
 //! optimization on top of this, not a prerequisite for it working.
 //!
-//! One command buffer + one fence, reused every frame and waited on synchronously in
-//! two stages (capture, then write-back) so the CPU can get at the bytes in between.
-//! This blocks `queue_present_khr` for as long as the two copies (plus the round trip)
-//! take -- correct, and the right first target given how much about the real
-//! frame-time budget is still unknown, but not yet double-buffered/pipelined; that is
-//! a follow-up once this path is proven to work at all.
+//! Stage 1 (capture into a staging buffer) is one command buffer + one fence,
+//! synchronous -- the CPU needs those bytes before it can even start the SHM round
+//! trip, so there's no way around blocking on it. What happens after the round trip
+//! depends on the settings and what's available: the common case (real GPU compose,
+//! no debug dump pending) is `composition::gpu::GpuCompose::dispatch_into_image_async`
+//! (2026-09-10) -- non-blocking, its own doc comment covers why that's sound. Every
+//! other case (CPU compose, a pending `capture_request`, `RGBA16F`, no GPU available)
+//! still falls back to the original synchronous stage-2 write-back below, one more
+//! command buffer + fence wait, same as this whole function used to always do.
 
 use ash::vk;
 
@@ -222,6 +225,17 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 /// whatever layout the caller found it in, `PRESENT_SRC_KHR`) if anything along the way
 /// doesn't work, so the caller can always fall back to presenting unmodified.
 ///
+/// Returns `Some(semaphore)` when (and only when)
+/// `composition::gpu::GpuCompose::dispatch_into_image_async` was used: `image` is
+/// already fully written with the composited result, but the GPU work that wrote it
+/// is not guaranteed *complete* yet (that is the entire point of the "async" in its
+/// name -- this function never blocks on it). The caller **must** add that semaphore
+/// to the real present call's own wait-semaphore list before presenting `image` --
+/// otherwise the presentation engine could display `image` before the compute work
+/// finishes writing it, a real, visible corruption/tearing bug, not merely a style
+/// preference. `None` in every other case means `image` is already fully complete and
+/// correctly laid out (`PRESENT_SRC_KHR`) -- safe to present with no extra wait.
+///
 /// # Safety
 /// `queue` must be the same queue `image`'s presentation was requested on, with no
 /// concurrent use of it from another thread for the duration of this call (the same
@@ -241,14 +255,14 @@ pub unsafe fn run(
     resources: &mut Option<CaptureResources>,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
-) -> bool {
+) -> Option<vk::Semaphore> {
     let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
     if frame_bytes == 0 || frame_bytes as usize > dlssnr_protocol::MAX_FRAME {
-        return false;
+        return None;
     }
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-        return false;
+        return None;
     }
     let r = resources.as_ref().expect("just ensured above");
 
@@ -257,12 +271,12 @@ pub unsafe fn run(
     // `RESET_COMMAND_BUFFER`; resetting before every `begin_command_buffer` is exactly
     // what that flag exists to allow.
     if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-        return false;
+        return None;
     }
     let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     // SAFETY: `r.cmd` was just reset above.
     if unsafe { device.begin_command_buffer(r.cmd, &begin_info) }.is_err() {
-        return false;
+        return None;
     }
     let to_transfer_src = barrier(
         image,
@@ -325,22 +339,22 @@ pub unsafe fn run(
         );
     }
     if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
-        return false;
+        return None;
     }
     // SAFETY: `r.fence` starts signaled (see `ensure`) or was reset+waited-on by the
     // previous call to this function; `queue` is the caller's, externally synchronized
     // for the duration of this call per this function's own safety contract.
     if unsafe { device.reset_fences(&[r.fence]) }.is_err() {
-        return false;
+        return None;
     }
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
     // SAFETY: `r.cmd` was just recorded and ended above.
     if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
-        return false;
+        return None;
     }
     // SAFETY: `r.fence` was just submitted against above.
     if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
-        return false;
+        return None;
     }
 
     // CPU side: the captured bytes are now in `r.ptr` (host-coherent, no explicit
@@ -367,14 +381,14 @@ pub unsafe fn run(
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
     let answered = shm.try_round_trip();
-    // `true` only when `composition::gpu::GpuCompose::dispatch_into_image` already
-    // wrote the fully composited result straight into `image` (and restored its
-    // `PRESENT_SRC_KHR` layout) itself -- skips the capture_request dump (nothing
-    // useful to dump: `r.ptr` still holds the *raw* answer, not the composited
-    // result, on this path) and stage 2 (there is nothing left for it to do) below,
-    // returning early instead. See `dispatch_into_image`'s own doc comment for why
-    // this is worth a whole separate path rather than just "one fewer copy".
-    let mut composed_directly = false;
+    // `Some(sem)` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
+    // already wrote the fully composited result straight into `image` itself, on the
+    // GPU's own timeline -- skips the capture_request dump (nothing useful to dump:
+    // `r.ptr` still holds the *raw* answer, not the composited result, on this path)
+    // and stage 2 (there is nothing left for it to do) below, returning early instead.
+    // The caller (`device.rs`) must chain `sem` into the real present call -- see this
+    // function's own doc comment and `dispatch_into_image_async`'s for why.
+    let mut composed_async: Option<vk::Semaphore> = None;
     if answered {
         // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
         // writes past the slice's length, which is exactly `frame_bytes` here.
@@ -393,20 +407,21 @@ pub unsafe fn run(
                     // handles) whenever the GPU path isn't applicable, isn't
                     // available, or fails, same fail-open discipline as every other
                     // stage in this function.
-                    let mut composed = false;
+                    let mut composed_sync = false;
                     if settings.debug_view == 0 {
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
-                        // Try the fast, no-CPU-round-trip path first -- but only when
+                        // Try the fast, non-blocking path first -- but only when
                         // nothing on the CPU needs to see the result afterward. A
                         // pending `capture_request` does (its dump needs real bytes
                         // in `r.ptr`), so that specific, rare, deliberately-triggered
-                        // case still goes through the slower CPU-visible `dispatch`
-                        // below, same as before this path existed.
+                        // case still goes through the slower, fully-synchronous
+                        // CPU-visible `dispatch` below, same as before this path
+                        // existed.
                         if !shm.capture_request_pending() {
                             if let Some(gpu) = gpu_compose {
-                                composed_directly = gpu.dispatch_into_image(
+                                composed_async = gpu.dispatch_into_image_async(
                                     device,
                                     instance,
                                     physical_device,
@@ -422,9 +437,9 @@ pub unsafe fn run(
                                 );
                             }
                         }
-                        if !composed_directly {
+                        if composed_async.is_none() {
                             if let Some(gpu) = gpu_compose {
-                                composed = gpu.dispatch(
+                                composed_sync = gpu.dispatch(
                                     device,
                                     instance,
                                     physical_device,
@@ -440,7 +455,7 @@ pub unsafe fn run(
                             }
                         }
                     }
-                    if !composed_directly && !composed {
+                    if composed_async.is_none() && !composed_sync {
                         crate::composition::apply::apply_rgba8(
                             &original,
                             answer_dst,
@@ -459,18 +474,19 @@ pub unsafe fn run(
         }
     }
     crate::log!(
-        "[capture] {}x{} {} bytes -> proxy; round trip answered={} composed_directly={}",
+        "[capture] {}x{} {} bytes -> proxy; round trip answered={} composed_async={}",
         width,
         height,
         frame_bytes,
         answered,
-        composed_directly
+        composed_async.is_some()
     );
-    if composed_directly {
-        // `image` is already fully written and back in `PRESENT_SRC_KHR` --
-        // `dispatch_into_image` did stage 2's whole job itself, in the same
-        // submission as the compute dispatch. Nothing left to do this frame.
-        return true;
+    if let Some(sem) = composed_async {
+        // `image` is already fully written (on the GPU's own timeline -- not
+        // necessarily *complete* yet, that's the entire point) and back in
+        // `PRESENT_SRC_KHR`. Nothing left to do this frame except hand `sem` up to
+        // the caller so the real present call waits on it.
+        return Some(sem);
     }
 
     // Real `ShmHeader::capture_request` support: dump this frame's original and
@@ -491,11 +507,11 @@ pub unsafe fn run(
     // still the captured bytes) -> image.
     // SAFETY: `r.cmd` was ended above; the pool it came from allows re-recording.
     if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-        return false;
+        return None;
     }
     // SAFETY: `r.cmd` was just reset.
     if unsafe { device.begin_command_buffer(r.cmd, &begin_info) }.is_err() {
-        return false;
+        return None;
     }
     let copy_in = copy_out;
     // SAFETY: `image` is currently `TRANSFER_DST_OPTIMAL` from stage 1's own final
@@ -526,26 +542,26 @@ pub unsafe fn run(
         );
     }
     if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
-        return false;
+        return None;
     }
     // SAFETY: same reasoning as stage 1's own fence reset/submit/wait.
     if unsafe { device.reset_fences(&[r.fence]) }.is_err() {
-        return false;
+        return None;
     }
     let submit2 = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
     // SAFETY: `r.cmd` was just recorded and ended above.
     if unsafe { device.queue_submit(queue, &[submit2], r.fence) }.is_err() {
-        return false;
+        return None;
     }
     // SAFETY: `r.fence` was just submitted against above. Waiting here (rather than
     // deferring to the next frame) keeps `image` fully write-back-complete and back in
     // `PRESENT_SRC_KHR` before this function returns, which is what the caller's own
     // immediately-following real present call requires.
     if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
-        return false;
+        return None;
     }
 
-    true
+    None
 }
 
 /// # Safety

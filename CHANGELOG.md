@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.14 — 2026-09-10
+
+- **Cross-frame async pipelining** (`GpuCompose::dispatch_into_image_async`, new):
+  submits the compute dispatch + write-back with a signal semaphore and returns
+  immediately instead of blocking on its own fence. `capture::run` now returns
+  `Option<vk::Semaphore>`; `device.rs`'s present hook chains it into the real
+  `vkQueuePresentKHR` call's own wait-semaphore list (combined with the app's own,
+  never replacing them) so the presentation engine — not our code — waits for the GPU
+  work before displaying the frame. Explicitly authorized: "do it if it gives us the
+  most frames when NR is on."
+- Genuinely double-buffered (`ASYNC_SLOTS = 2`, independent images/staging
+  buffer/command buffer/fence/semaphore each) to avoid a real data race between two
+  in-flight dispatches; the only wait is on a slot's *own* fence from its *previous*
+  use, immediately before reuse, never before returning the current result. Verified
+  the binary-semaphore reuse discipline is sound both by reasoning (a wait is always
+  chained into that same frame's present call before the same slot could ever be
+  reused) and by a new test driving it across many more iterations than there are
+  slots, against a real device.
+- Deliberately did not add reprojection/stale-answer tricks to chase a bigger win:
+  without real motion vectors, that would cause real visible ghosting on moving
+  content. Every frame's presented image still comes from that same frame's own
+  capture and model answer — only *when* the CPU learns the work is done changed.
+- Verified thoroughly on real hardware before trusting it: a short run first
+  (watching specifically for hangs/crashes), then a real 10s measurement, then a real
+  `capture_request` dump (still visually correct), then a 45-second/601-frame stress
+  run to rule out a slot-reuse issue only surfacing after many cycles. Zero crashes,
+  zero hangs, zero fallbacks except when a capture_request was genuinely pending.
+- Real gain: 143 frames/10s, up from 128 (~134/10s sustained over 45s). Documented
+  this is likely close to the practical ceiling for the current architecture — the
+  remaining gap to the 244-frame no-composition baseline is real GPU bandwidth/work
+  volume, not something more scheduling cleverness can remove.
+- 3 new tests, 30 tests in this crate now, full suite green.
+
 ## 0.1.13 — 2026-09-10
 
 - **Merged GPU compose + write-back into one submission** (`GpuCompose::dispatch_into_image`,

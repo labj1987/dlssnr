@@ -296,6 +296,13 @@ impl DeviceHooks for DlssnrDeviceInfo {
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
         };
+        // Set by `capture::run` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
+        // wrote this frame's composited result asynchronously -- see that function's
+        // own doc comment. When `Some`, the real present call below *must* wait on it,
+        // or the presentation engine could display the image before the GPU work that
+        // writes it has actually finished (a real, visible corruption bug, not a style
+        // preference).
+        let mut wait_semaphore: Option<vk::Semaphore> = None;
         if crate::layer_enabled() {
             // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
             // parallel pair of slices for the duration of this call -- part of the
@@ -346,7 +353,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                     // `PRESENT_SRC_KHR` per `vkQueuePresentKHR`'s precondition on every
                     // image it's about to present.
                     unsafe {
-                        capture::run(
+                        wait_semaphore = capture::run(
                             &self.device,
                             instance,
                             self.physical_device,
@@ -368,7 +375,36 @@ impl DeviceHooks for DlssnrDeviceInfo {
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
-        let result = unsafe { next_present(queue, present_info) };
+        let result = if let Some(sem) = wait_semaphore {
+            // Combine whatever wait semaphores the app itself already provided with
+            // our own -- never replace them, `capture::run`'s own compute work is an
+            // *additional* dependency the present must wait on, not a substitute for
+            // whatever the app was already correctly synchronizing against (its own
+            // rendering-complete semaphore, most commonly).
+            let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 1);
+            if present_info.wait_semaphore_count > 0 {
+                // SAFETY: `p_wait_semaphores` is a valid slice of `wait_semaphore_count`
+                // elements per `present_info`'s own contract, valid for this call's
+                // duration.
+                combined.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(present_info.p_wait_semaphores, present_info.wait_semaphore_count as usize)
+                });
+            }
+            combined.push(sem);
+            // Copies every other field (`p_next`, `swapchain_count`, `p_swapchains`,
+            // `p_image_indices`, `p_results`) unchanged from the app's own
+            // `present_info` -- only the wait-semaphore list is actually different.
+            let modified_info = vk::PresentInfoKHR { wait_semaphore_count: combined.len() as u32, p_wait_semaphores: combined.as_ptr(), ..*present_info };
+            // SAFETY: `modified_info` is valid for the duration of this call --
+            // `combined` (which it borrows from) outlives it; `next_present` was
+            // resolved from the next layer/driver's own proc-addr table.
+            unsafe { next_present(queue, &modified_info) }
+        } else {
+            // SAFETY: `present_info` is valid for the duration of this call;
+            // `next_present` was resolved from the next layer/driver's own
+            // proc-addr table.
+            unsafe { next_present(queue, present_info) }
+        };
         LayerResult::Handled(result.result())
     }
 }
