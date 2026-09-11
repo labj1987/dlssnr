@@ -23,6 +23,7 @@ use ash::vk;
 
 use crate::abi::{self, NgxParameter};
 use crate::guard::guarded;
+use crate::selfparam;
 use crate::spoof::{self, InstalledSpoof};
 
 #[link(name = "kernel32")]
@@ -64,6 +65,10 @@ pub struct NgxSnippet {
 
     params: NgxParameter,
     params_destroy: Option<abi::FnVkDestroyParameters>,
+    /// True when `params` came from [`crate::selfparam::allocate`], not a DLL export —
+    /// teardown must call [`crate::selfparam::destroy`] instead of `params_destroy` in
+    /// that case (there's no real `DestroyParameters` call to make on our own object).
+    self_params: bool,
 
     /// The Vulkan device NGX was initialized against — `Shutdown1` must be called with
     /// this exact device, not a null placeholder.
@@ -94,6 +99,7 @@ impl Default for NgxSnippet {
             shutdown1: None,
             params: std::ptr::null_mut(),
             params_destroy: None,
+            self_params: false,
             device: vk::Device::null(),
             feature: std::ptr::null_mut(),
             disabled: false,
@@ -263,31 +269,52 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         }
     });
 
-    let Some(alloc) = alloc else {
-        crate::log!("[ngx] no AllocateParameters export found on core or snippet");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+    // Falls back to a self-implemented `NVSDK_NGX_Parameter` object
+    // (`crate::selfparam`) whenever the DLL doesn't export `AllocateParameters` at
+    // all, or its real call rejects -- confirmed via a real side-by-side run against
+    // upstream's own compiled helper on `lordnikon` (2026-09-11) that this is not a
+    // corner case to treat as fatal: upstream hits the identical rejection from
+    // Core's own allocator in this exact environment and recovers exactly this way,
+    // going on to a real, successful `CreateFeature(18)` afterward. See
+    // `selfparam`'s module doc comment for the full evidence.
+    let params = match alloc {
+        Some(alloc) => {
+            crate::log!("[ngx] calling AllocateParameters now");
+            crate::logging::flush();
+            let (alloc_result, seh) = guarded(
+                || {
+                    let mut params: NgxParameter = std::ptr::null_mut();
+                    // SAFETY: `alloc` resolved above from a live module; `&mut params`
+                    // is a valid out-pointer for the call's duration.
+                    let r = unsafe { alloc(&mut params) };
+                    (r, params)
+                },
+                (abi::result::FAIL_SEH, std::ptr::null_mut()),
+            );
+            let (alloc_code, params) = alloc_result;
+            crate::log!("[ngx] AllocateParameters -> {:#x} seh={:#x}", alloc_code as u32, seh);
+            crate::logging::flush();
+            if abi::succeeded(alloc_code) && !params.is_null() {
+                Some(params)
+            } else {
+                None
+            }
+        }
+        None => {
+            crate::log!("[ngx] no AllocateParameters export found on core or snippet");
+            crate::logging::flush();
+            None
+        }
     };
-    crate::log!("[ngx] calling AllocateParameters now");
-    crate::logging::flush();
-    let (alloc_result, seh) = guarded(
-        || {
-            let mut params: NgxParameter = std::ptr::null_mut();
-            // SAFETY: `alloc` resolved above from a live module; `&mut params` is a
-            // valid out-pointer for the call's duration.
-            let r = unsafe { alloc(&mut params) };
-            (r, params)
-        },
-        (abi::result::FAIL_SEH, std::ptr::null_mut()),
-    );
-    let (alloc_code, params) = alloc_result;
-    crate::log!("[ngx] AllocateParameters -> {:#x} seh={:#x}", alloc_code as u32, seh);
-    crate::logging::flush();
-    if !abi::succeeded(alloc_code) || params.is_null() {
-        s.disabled = true;
-        return s;
-    }
+    let params = match params {
+        Some(params) => params,
+        None => {
+            crate::log!("[ngx] falling back to a self-implemented NVSDK_NGX_Parameter object");
+            crate::logging::flush();
+            s.self_params = true;
+            selfparam::allocate()
+        }
+    };
     s.params = params;
 
     // Round-trip self-test: set a scratch value through the parameter vtable, then
@@ -656,7 +683,12 @@ pub fn teardown(mut s: NgxSnippet) {
         crate::log!("[ngx] Shutdown1 -> {:#x} seh={:#x}", result as u32, seh);
     }
     if !s.params.is_null() {
-        if let Some(destroy) = s.params_destroy {
+        if s.self_params {
+            // SAFETY: `s.params` was allocated by `selfparam::allocate` and never
+            // destroyed since, exactly matching `destroy`'s contract.
+            unsafe { selfparam::destroy(s.params) };
+            crate::log!("[ngx] destroyed the self-implemented parameter object");
+        } else if let Some(destroy) = s.params_destroy {
             let params = s.params;
             let (result, seh) = guarded(|| unsafe { destroy(params) }, abi::result::FAIL_SEH);
             crate::log!("[ngx] DestroyParameters -> {:#x} seh={:#x}", result as u32, seh);

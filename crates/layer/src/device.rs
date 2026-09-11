@@ -159,6 +159,13 @@ impl DlssnrDeviceInfo {
             handle,
             create.is_some() && destroy.is_some() && present.is_some()
         );
+        // Explicit flush: a one-time-per-device event, not the per-frame hot path
+        // `logging::log`'s modulo-64 throttle exists for -- worth the syscall so this
+        // milestone survives a process killed by a signal before its normal exit path
+        // (confirmed missing this session: a `timeout`-killed `vkcube` lost every log
+        // line after this one, including real per-frame activity, purely because
+        // nothing forced a flush past this first, coincidentally-flushed call).
+        crate::logging::flush();
         Self {
             device,
             instance,
@@ -263,6 +270,9 @@ impl DeviceHooks for DlssnrDeviceInfo {
             state.images.len()
         );
         self.state.lock().unwrap().swapchains.insert(swapchain, state);
+        // Explicit flush, same reasoning as `new()`'s -- a one-time-per-swapchain
+        // milestone, not the per-frame hot path.
+        crate::logging::flush();
         LayerResult::Handled(Ok(swapchain))
     }
 

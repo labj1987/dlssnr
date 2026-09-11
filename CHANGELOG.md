@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.25 — 2026-09-11
+
+- **Real DLSS 5 Neural Rendering works again, end to end, for the first time since
+  the app-removal/reinstall that broke it.** A real `vkcube` run on `lordnikon`
+  showed `model_up=1`, `helper_frames=128` over a 10-second run, real
+  `VULKAN_CreateFeature(18) -> 0x1`, and `EvaluateFeature -> 0x1` on essentially
+  every frame. Two separate real bugs were found and fixed to get here — see
+  CLAUDE.md's updated NGX section for the full writeup.
+- **Fixed the `0xbad00002` (`FAIL_PLATFORM_ERROR`) NGX blocker.** A real
+  side-by-side comparison against upstream's own compiled helper (recovered from its
+  official GitHub release, `bmitch87/DLSS5VKLayer` `0.2.6-1`) showed upstream hits
+  the identical rejection from Core's own allocator in this exact environment, and
+  recovers with a self-implemented, in-process `NVSDK_NGX_Parameter` object instead
+  of the DLL's own `AllocateParameters`. New `crates/helper/src/selfparam.rs`
+  implements the same recovery: a real `NVSDK_NGX_Parameter`-shaped vtable object
+  backed by a plain `HashMap`, used whenever the DLL's own allocator fails or isn't
+  exported. Also removed an unproven `NVSDK_NGX_VULKAN_Init_ProjectID` call added
+  earlier the same day — real testing showed it wasn't the cause of anything.
+- **Fixed a second, separate, pre-existing bug found while verifying the first
+  fix**: `capture::run`'s first line checked `shm.composition_settings()`, which
+  only reads through an already-open SHM mapping — but nothing opens the mapping
+  until *later* in the same function, gated behind that same check. On a brand-new
+  process the mapping was never open, so the function always bailed out before ever
+  capturing a single frame, on every present call, silently. Fixed by calling
+  `shm.open()` (already idempotent) unconditionally as the function's first line.
+- Fixed a related logging bug: the layer's per-frame log-flush throttle meant a
+  `vkcube` process killed by `timeout`'s default `SIGTERM` lost every buffered log
+  line since the last flush, including one-time startup milestones. Added explicit
+  `logging::flush()` calls after device/swapchain creation (one-time events, not the
+  per-frame hot path the throttle protects).
+- Full workspace test suite stays green throughout (33 layer tests, full helper/
+  supervisor/protocol suites).
+
 ## 0.1.24 — 2026-09-11
 
 - **Real progress on the NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) blocker documented

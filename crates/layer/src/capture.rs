@@ -286,6 +286,20 @@ pub unsafe fn run(
     inflight: &mut Inflight,
     answer_scratch: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
+    // `composition_settings()` (and everything else below) only ever reads through an
+    // already-open mapping -- nothing about it opens one. Every real path that DOES
+    // open the mapping (`try_round_trip`/`begin_async_request`) lives later in this
+    // same function, gated behind the `composition_settings()` check right below.
+    // Real bug, found and fixed 2026-09-11 via a live `vkcube` bisection on
+    // `lordnikon`: on a brand-new process the mapping is never open yet, so this used
+    // to return `None` here on literally every single frame, forever -- this function
+    // was being called every present call (confirmed real, not theoretical) but never
+    // actually captured or sent a single frame, because it always bailed out before
+    // ever reaching the code that would open the mapping in the first place.
+    // `ShmClient::open` is cheap to call unconditionally (an immediate no-op once
+    // already open, see its own early return), so there's no real cost to calling it
+    // here up front instead of leaving each caller to remember to.
+    shm.open();
     let Some(settings) = shm.composition_settings() else { return None };
     // `debug_view`'s compare/split views and a pending `capture_request`'s dump both
     // need *this* frame's own original and answer, not whatever the async pipeline

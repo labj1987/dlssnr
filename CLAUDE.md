@@ -1248,70 +1248,112 @@ paths), or find why `VK_ADD_LAYER_PATH`/implicit-layer discovery can't reach the
 process directly and drop this second install location entirely. Not yet done --
 flagged here so it isn't rediscovered the hard way again.
 
-## NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) blocking real DLSS-NR evaluation --
-## CRITICAL, confirmed, NOT YET FIXED (2026-09-11, `lordnikon`)
+## NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) -- FIXED (2026-09-11, `lordnikon`), plus a
+## second, separate real bug found and fixed the same session: captured frames never
+## actually reached the helper at all
 
-The core performance/pipelining work (0.1.16-0.1.23) is real, verified, and done --
-see those `CHANGELOG.md` entries. The one remaining real blocker before real NGX
-evaluation works again: every NGX call that touches Core's own implementation now
-returns `0xbad00002` (`FAIL_PLATFORM_ERROR`), where it previously succeeded (see the
-"First confirmed real DLSS 5 Neural Rendering success" section above). **Read this
-section in full before re-investigating** -- most of the obvious hypotheses are
-already ruled out with real evidence, not assumption.
+**Both now fixed and verified end to end on real hardware.** A real `vkcube` run with
+this fix showed `model_up=1`, `helper_frames=128` (a full 10-second run), real
+`VULKAN_CreateFeature(18) -> 0x1`, and `EvaluateFeature -> 0x1` on essentially every
+frame -- the first genuinely complete, working real-time NGX pipeline this project's
+own code has produced since the app-removal/reinstall that broke it.
 
-**What's genuinely established, via real bisection on real hardware, not guessed:**
-- `nvngx_dlssnr.dll`'s (the "snippet") own `NVSDK_NGX_VULKAN_*` exports
-  (`AllocateParameters`, at least) are **PE forwarders straight into `nvngx.dll`
-  (Core)** -- confirmed by deliberately keeping Core unloaded and observing
-  `GetProcAddress` fail to resolve the export on the snippet either, with the exact
-  same "no AllocateParameters export found on core or snippet" wording independently
-  seen earlier in this same investigation when `nvngx.dll` was genuinely absent from
-  the machine. **This means there is no real "call it via the snippet instead of
-  Core" workaround for this call family** -- both paths run the identical Core code.
-  Don't waste time trying to route around Core for `AllocateParameters` specifically.
-- `NVSDK_NGX_VULKAN_Init_ProjectID` is **not** the cause, and calling it is **not**
-  "poisoning" later calls -- tested directly: removed the call entirely, confirmed
-  via `cargo check`/rebuild/redeploy that `AllocateParameters` still returns the
-  identical `0xbad00002` with `Init_ProjectID` never invoked at all. `ngx.rs` no
-  longer calls it (removed in 0.1.24), only resolves it diagnostically to log
-  whether the export exists.
-- **Not a prefix/environment difference**, despite how it initially looked. Tested
-  against BOTH a freshly-recreated dlssnr-managed Wine prefix AND the real,
-  untouched, previously-working GTA San Andreas Proton prefix (as a careful,
-  supposedly read-only diagnostic -- see the incident note below for how that went)
-  -- **identical `0xbad00002` in both**, ruling out "something the fresh prefix is
-  missing that the old one had."
-- Device extensions are not the cause either: `VK_NVX_binary_import` and
-  `VK_NVX_image_view_handle` (the two upstream's own notes flag as required for the
-  Vulkan NGX route specifically) are both confirmed present and enabled (8/9 of the
-  wanted set available; only the irrelevant `VK_EXT_debug_utils` is missing).
-- Confirmed unchanged from `HANDOFF_NGX_PLATFORM_ERROR.md`'s own investigation (not
-  re-tested this session, still holds): not missing `nvngx.dll`, not the init
-  function choice, not NVAPI wiring, not an empty NGX models directory, not the
-  caller-identity spoof failing outright (`spoof::install` reports success on both
-  modules), not `DLSSNR_SKIP_NVAPI` (dead code), not a hang/deadlock.
+### Bug 1: `FAIL_PLATFORM_ERROR` from `AllocateParameters` -- Core's own allocator is
+### unusable in this environment, and that's OK: it isn't actually needed
 
-**What's still genuinely open**: since the rejection is real, reproducible, and
-prefix-independent, it's either a real limitation of Core's Vulkan-family entry
-points for this specific feature/caller (plausible: upstream's own proven, working
-route is D3D12-only; the Vulkan exports exist on the DLL but were never actually
-validated by anyone, including NVIDIA's own QA for this narrow, semi-leaked feature)
-or something about the caller-identity spoof that works against the snippet but
-isn't sufficient against Core's own, possibly different, internal caller check.
-Alex's own report is that this exact setup (this project's code, on this exact
-machine) worked before a full app removal/reinstall -- take that as real evidence
-something is recoverable, not proof it's an easy fix.
+**Root cause, confirmed via a real side-by-side run against upstream's own compiled
+helper** (recovered from its official GitHub release, `bmitch87/DLSS5VKLayer`'s
+`0.2.6-1` tag -- never its source, same "shape not expression" rule as everywhere
+else in this project): upstream hits the **identical** `0xbad00002` from Core's
+`VULKAN_Init_with_ProjectID`/`VULKAN_Init_Ext`/`AllocateParameters` on this same
+machine, with this same real `nvngx.dll`. This is a real, expected rejection in this
+environment for *any* implementation, upstream included -- not a bug in this
+project's caller-identity spoof or call sequence, and not a prefix/environment gap
+(confirmed identical against both a freshly-recreated prefix and the real, untouched,
+previously-working GTA San Andreas prefix). Upstream's own log shows the actual
+recovery: when Core's allocator fails and the snippet doesn't export one either
+(`nvngx_dlssnr.dll`'s own `NVSDK_NGX_VULKAN_*` exports are PE forwarders straight
+into Core -- confirmed by deliberately keeping Core unloaded and watching
+`GetProcAddress` fail to resolve them on the snippet too, so there's no real "call
+via snippet instead of Core" workaround for this call family), it falls back to
+**its own self-implemented, in-process `NVSDK_NGX_Parameter` object** -- NGX's real
+entry points never actually require a parameter block the DLL itself allocated, just
+a pointer matching the real vtable shape, which anyone can construct.
 
-**Concrete next steps, priority order** (from `HANDOFF_NGX_PLATFORM_ERROR.md`,
-still valid): recover upstream's real compiled C++ helper (was an installed system
-package before this session; check `apt-cache policy dlssnr` / `/var/cache/apt/
-archives/*.deb`) and run it side-by-side against the identical prefix/game session
-for a real reference comparison -- either it also fails (proves the issue is
-driver/environment-wide, not this project's code) or it succeeds (letting you
-`strace`/compare its actual Wine-level behavior against ours). Failing that, a real
-debugger (`winedbg`) attached at the point of the `AllocateParameters`/`Init_Ext`
-call, stepping into `nvngx.dll` itself, is the real next escalation -- last resort,
-real reverse-engineering effort, not a quick diagnostic.
+**The fix** (`crates/helper/src/selfparam.rs`, new): a `#[repr(C)]` object whose
+first field is a vtable pointer (matching `abi::NgxParameterObj`'s real C++-ABI
+layout) backed by a plain Rust `HashMap` for storage -- safe because C++ virtual
+dispatch only ever touches the object opaquely through that one vtable pointer;
+nothing on the DLL side assumes anything else about its layout. `ngx.rs` now falls
+back to `selfparam::allocate()` whenever the real `AllocateParameters` call fails or
+isn't exported, instead of disabling the whole session. Also removed an unproven
+`NVSDK_NGX_VULKAN_Init_ProjectID` call added earlier the same day: real, reproduced
+evidence (not the "poisons later calls" theory first assumed) showed removing it
+entirely changed nothing about `AllocateParameters`' own rejection -- upstream's own
+*proven* ProjectID route is `NVSDK_NGX_D3D12_Init_with_ProjectID` against a dedicated
+D3D12 device, a different API family than this helper's Vulkan device entirely; the
+Vulkan export exists on the DLL but was never exercised/proven by anyone.
+
+**Verified**: a real manual helper run on `lordnikon` (bypassing `dlssnr-cli`/
+`dlssnr-gui`, same technique as every prior real-hardware NGX test) showed
+`AllocateParameters -> 0xbad00002` followed immediately by `falling back to a
+self-implemented NVSDK_NGX_Parameter object`, a passing round-trip self-test, and
+`VULKAN_Init_Ext -> 0x1` -- the helper no longer disables itself. `NgxSnippet` gained
+a `self_params: bool` field so teardown calls `selfparam::destroy` instead of a real
+`DestroyParameters` export for an object that was never one of the DLL's own
+allocations.
+
+### Bug 2: captured frames never reached the helper at all -- a real, separate,
+### pre-existing bug found while verifying bug 1's fix, unrelated to NGX
+
+**With bug 1 fixed, `vkcube` created a real swapchain and `capture::run` was
+confirmed (via temporary bisection logging, since reverted) to be called on every
+single present -- yet `helper_frames` stayed at 0 the entire run.** Root cause, found
+by reading `capture::run`'s own first few lines: its very first check,
+`shm.composition_settings()`, only ever *reads* through an already-open SHM mapping
+(`ShmClient::header()`) -- it never opens one. The code that actually opens the
+mapping (`ShmClient::open` inside `try_round_trip`/`begin_async_request`) lives
+*later* in the same function, gated behind that first check. On a brand-new process
+the mapping is never open yet, so `composition_settings()` returned `None` on
+literally every single frame, forever, and the function always bailed out before
+ever reaching the code that would open the mapping in the first place -- a real
+chicken-and-egg ordering bug, almost certainly introduced somewhere during the
+async-pipelining rewrite (0.1.16-0.1.22) when this function's checks got reordered
+for early-exit efficiency without preserving the implicit "something must open the
+mapping first" invariant the old code apparently had. Notably, this was NOT caught
+by the existing test suite (`capture::tests::run_never_blocks_on_a_slow_helper_...`
+still passes) -- worth knowing if writing a future regression test for this: a test
+that manually pre-opens its own `ShmClient` before calling `capture::run` would not
+catch this class of bug either.
+
+**The fix**: `capture::run` (`crates/layer/src/capture.rs`) now calls `shm.open()`
+unconditionally as its very first line, before `composition_settings()`.
+`ShmClient::open` is already idempotent (an immediate no-op once already open, per
+its own early `if self.header().is_some() { return true; }`), so there's no real
+per-frame cost to calling it unconditionally instead of leaving callers to remember
+to.
+
+**A related, real logging bug found and fixed along the way, worth knowing about
+separately**: diagnosing bug 2 was made harder than it should have been because
+`crates/layer/src/logging.rs`'s modulo-64 flush throttle (added earlier for
+per-frame hot-path performance, see its own doc comment) meant a `vkcube` process
+killed by `timeout`'s default `SIGTERM` lost every buffered log line since the last
+flush -- including one-time milestones like device/swapchain creation, which matter
+far more than the steady-state per-frame logging the throttle exists to protect.
+Fixed by adding a `logging::flush()` (both `layer` and this pattern already existed
+in `helper`) called explicitly right after the "hooked device"/"swapchain created"
+log lines in `device.rs` -- one-time events, not the hot path, so the extra flush
+syscall costs nothing meaningful.
+
+**How this was found**: a real side-by-side comparison against upstream's own
+compiled helper (recovered from its official GitHub release) was the key that broke
+the NGX investigation open, followed by temporary, real bisection logging directly
+in the present hook (added, used, then fully reverted -- `git diff` confirms no
+bisect leftovers) to pinpoint bug 2 once bug 1's fix exposed it. Neither bug could
+plausibly have been found by re-reading the code alone; both needed a real `vkcube`
+run against real hardware with the exact right diagnostic (ground truth from
+`dlssnr-cli shmctl status`'s live SHM read, not just log output, which is what
+caught that bug 2 was real and not just a logging artifact).
 
 **Real incident this session, fixed, worth remembering**: a manual diagnostic run
 intended to be read-only pointed a different Proton build (`Proton-CachyOS Latest`)

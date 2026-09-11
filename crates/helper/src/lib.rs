@@ -8,5 +8,6 @@ pub mod frame;
 pub mod guard;
 pub mod logging;
 pub mod ngx;
+pub mod selfparam;
 pub mod shm;
 pub mod spoof;

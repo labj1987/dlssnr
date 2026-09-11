@@ -70,6 +70,18 @@ pub fn log(args: Arguments<'_>) {
     }
 }
 
+/// Forces a flush outside the modulo-64 throttle above. Confirmed missing and worth
+/// having, 2026-09-11: a process killed by a signal (e.g. `timeout`'s default SIGTERM)
+/// never runs the throttle's own eventual flush, silently losing every buffered line
+/// since the last one -- including one-time milestones like device/swapchain creation
+/// that matter far more than the steady-state per-frame logging the throttle exists
+/// to protect. Call this after any one-shot milestone, never from the per-frame hot
+/// path itself.
+pub fn flush() {
+    let Ok(mut sink) = sink().lock() else { return };
+    let _ = sink.flush();
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
