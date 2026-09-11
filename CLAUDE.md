@@ -1553,6 +1553,25 @@ pass: `paths::tests::finds_a_real_steam_install_under_xdg_data_home` and
 `XDG_DATA_HOME` env var (confirmed genuinely intermittent under `cargo test`'s
 workspace-wide scheduling, not hypothetical) -- fixed with a shared lock.
 
+**One more real bug in this very fix, caught testing it before trusting it
+(0.1.29)**: the first version of `stop()`'s new `wineserver -k` call passed
+`paths::prefix_dir()` directly as `WINEPREFIX` -- but for `runner_type = "proton"`
+that isn't the prefix Wine itself actually uses. Proton's own launch script
+internally re-derives and uses `STEAM_COMPAT_DATA_PATH/pfx` (`start()` hands
+`prefix_dir()` to Proton *as* `STEAM_COMPAT_DATA_PATH`), so the real, live
+`WINEPREFIX` is always one level deeper. Caught immediately by testing the deployed
+fix against the exact orphaned process it was meant to clean up: `wineserver -k`
+with the bare prefix dir exited `1` and killed nothing; the identical command with
+`/pfx` appended exited `0` and actually worked. Fixed with a new, deliberately pure
+`real_wineprefix(cfg, prefix_dir)` function (takes the prefix as a parameter rather
+than calling `paths::prefix_dir()` itself, specifically so it's testable without
+touching the process-wide `XDG_DATA_HOME` env var the real function depends on) --
+2 new tests. **Lesson for next time**: this exact `/pfx`-nesting gotcha was already
+documented once earlier in this file (the "Real incident this session" note on
+Proton version mismatches) -- write real, automated regression coverage for a
+gotcha the first time it's found, not just a comment, or it silently costs a second
+real bug later exactly like it did here.
+
 **Not yet re-tested against GTA V Enhanced itself** after this fix and the
 cleanup -- the immediate cause of "no effect" this session was the corrupted
 shared state from the orphaned process, not necessarily anything specific to that

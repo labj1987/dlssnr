@@ -42,7 +42,7 @@ pub fn stop(timeout: Duration) -> std::io::Result<()> {
     process::stop(&pid_file(), timeout)?;
     let cfg = Config::load();
     if let Some(wineserver) = wineserver_binary(&cfg) {
-        let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", paths::prefix_dir()).status();
+        let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", real_wineprefix(&cfg, &paths::prefix_dir())).status();
     }
     Ok(())
 }
@@ -61,6 +61,27 @@ fn wineserver_binary(cfg: &Config) -> Option<String> {
         None
     } else {
         Some("wineserver".to_string())
+    }
+}
+
+/// The real `WINEPREFIX` a real wineserver command needs, given `prefix_dir`
+/// (`paths::prefix_dir()` in real use, passed in rather than read directly so this
+/// stays a pure function -- easy to test without touching the process-wide
+/// `XDG_DATA_HOME` env var `prefix_dir()` itself depends on). **Not** simply
+/// `prefix_dir` unchanged: real, confirmed bug caught testing the fix above on
+/// `lordnikon` before it ever shipped -- for `runner_type = "proton"`, `start()`
+/// hands `prefix_dir` to Proton as `STEAM_COMPAT_DATA_PATH`, but Proton's own
+/// launch script internally re-derives and uses `STEAM_COMPAT_DATA_PATH/pfx` as
+/// wine's *real* prefix. Confirmed directly: `wineserver -k` with
+/// `WINEPREFIX=<prefix_dir>` exits `1` and kills nothing; `WINEPREFIX=
+/// <prefix_dir>/pfx` exits `0` and actually works, against the exact same live
+/// orphaned process. Plain Wine (`runner_type = "wine"`) has no such nesting;
+/// `prefix_dir` is already the real prefix there.
+fn real_wineprefix(cfg: &Config, prefix_dir: &str) -> String {
+    if cfg.runner_type == "proton" {
+        format!("{prefix_dir}/pfx")
+    } else {
+        prefix_dir.to_string()
     }
 }
 
@@ -195,5 +216,17 @@ mod tests {
     #[test]
     fn wineserver_binary_is_none_with_no_runner_configured() {
         assert_eq!(wineserver_binary(&Config::default()), None);
+    }
+
+    #[test]
+    fn real_wineprefix_appends_pfx_for_proton() {
+        let cfg = Config { runner_type: "proton".to_string(), ..Config::default() };
+        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/dlssnr/prefix"), "/home/alex/.local/share/dlssnr/prefix/pfx");
+    }
+
+    #[test]
+    fn real_wineprefix_is_unchanged_for_plain_wine() {
+        let cfg = Config { runner_type: "wine".to_string(), ..Config::default() };
+        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/dlssnr/prefix"), "/home/alex/.local/share/dlssnr/prefix");
     }
 }

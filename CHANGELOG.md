@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.29 — 2026-09-11
+
+- **Fixes a real bug in 0.1.28's own fix, caught testing it on `lordnikon` before
+  trusting it**: `stop()`'s new `wineserver -k` call used `paths::prefix_dir()`
+  directly as `WINEPREFIX`, but for `runner_type = "proton"` that's not the real
+  prefix Wine itself uses — Proton's own launch script internally re-derives and
+  uses `STEAM_COMPAT_DATA_PATH/pfx`. Confirmed directly against the exact orphaned
+  process 0.1.28 was meant to clean up: `wineserver -k` with the bare prefix dir
+  exits `1` and kills nothing; with `/pfx` appended, exits `0` and actually works.
+  New `real_wineprefix` (a pure function, 2 new tests) computes the correct value
+  per runner type — plain Wine has no such nesting and is unaffected.
+
 ## 0.1.28 — 2026-09-11
 
 - **Fixed a real bug found while investigating "GTA V Enhanced has no effect and no
