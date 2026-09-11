@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.30 — 2026-09-11
+
+- **Fixed the AppImage update mechanism itself** — reported live: "I cannot update
+  dlssnr using Gear Lever" (its own "check for updates" ran but reported nothing
+  newer, despite this exact release existing). `build-appimage.sh` embedded
+  `gh-releases-zsync|labj1987|Dlssnr|latest|...` (capital `D`) as the update-check
+  info, but the real repository is `labj1987/dlssnr` (lowercase). GitHub's own
+  API/web redirects resolve the case mismatch fine (confirmed directly), but Gear
+  Lever's own update client apparently does not — matching the exact real-world
+  symptom reported, not a hypothetical. Fixed to match the repo's real casing
+  exactly, rather than relying on any client redirecting a mismatch correctly.
+  Also gave `zsyncmake` a real, absolute `-u <url>` (this exact release's GitHub
+  download URL) instead of letting it default to a bare relative filename in the
+  `.zsync` sidecar's own internal "URL:" header — a second, separate piece of
+  update metadata from `UPDATE_INFORMATION` above, used by whatever client
+  actually downloads the new bytes once an update is found.
+- **Separate, real mistake found and corrected the same session**: every AppImage
+  rebuild from v0.1.24 through v0.1.29 was manually deployed to
+  `~/AppImages/dlssnr.appimage` on `lordnikon` — a plain, unversioned file, *not*
+  the one Gear Lever actually integrates and manages
+  (`~/AppImages/dlssnr.appimage_0_1_25.appimage`, confirmed via its own `.desktop`
+  launcher entry). The two are completely independent files (different inodes);
+  none of those GUI/CLI-level fixes (the console-window fix, the orphaned-helper
+  `stop()` fix) ever reached the copy the user's desktop icon actually launches.
+  The game's own real rendering fixes were unaffected by this mistake — those load
+  the Vulkan layer `.so` directly from a separate, already-correct path.
+
 ## 0.1.29 — 2026-09-11
 
 - **Fixes a real bug in 0.1.28's own fix, caught testing it on `lordnikon` before

@@ -110,7 +110,14 @@ fi
 echo "==> Packing AppImage"
 OUT="$APP-$VERSION-$ARCH.AppImage"
 
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|Dlssnr|latest|$APP-*-x86_64.AppImage.zsync"
+# Real repo is "dlssnr" (lowercase) -- "Dlssnr" here was a real, confirmed bug found
+# 2026-09-11: GitHub's own API/web redirects resolve a case-mismatched repo name
+# fine (confirmed via `gh api repos/labj1987/Dlssnr/...`), but Gear Lever's own
+# update-check client apparently does not -- a real user report ("no updates
+# found" despite a genuinely newer release existing) is what caught this, not
+# inspection alone. Match the real repo's exact casing, don't rely on any client
+# redirecting a mismatch correctly.
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|dlssnr|latest|$APP-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
@@ -119,8 +126,18 @@ ls -lh "$OUT"
 
 # appimagetool's built-in zsync generation silently no-ops on some CI runners (see
 # KernelPop's CLAUDE.md); build the sidecar directly instead. Non-fatal.
+#
+# `-u <url>` here is a *second*, different piece of update metadata than
+# `UPDATE_INFORMATION` above: it's the .zsync file's own internal "URL:" header,
+# read by whatever HTTP client actually fetches the new AppImage bytes once a zsync
+# client has decided (via UPDATE_INFORMATION's gh-releases-zsync scheme) that an
+# update exists. Without it, zsyncmake defaults to a bare relative filename, which
+# only resolves correctly if a client does real relative-URL resolution against
+# wherever it fetched this .zsync from -- not guaranteed. Point it at this exact
+# release's real, absolute GitHub download URL instead of relying on that.
+ZSYNC_URL="https://github.com/labj1987/dlssnr/releases/download/v$VERSION/$OUT"
 echo "==> Generating .zsync sidecar"
-if zsyncmake "$OUT"; then
+if zsyncmake -u "$ZSYNC_URL" "$OUT"; then
     echo "==> .zsync generated: $OUT.zsync"
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"

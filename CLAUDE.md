@@ -1578,3 +1578,67 @@ shared state from the orphaned process, not necessarily anything specific to tha
 game, but that's inference, not confirmation. If it still shows no effect after a
 clean helper restart, treat that as a fresh, unconfirmed report, not a re-run of
 this same bug.
+
+## `~/AppImages/dlssnr.appimage` is NOT the real, Gear-Lever-managed app -- a real
+## deployment mistake this whole session, found and fixed (0.1.30)
+
+**Read this before ever deploying a build to `lordnikon` by hand again.** Every
+AppImage rebuild from v0.1.24 through v0.1.29 this session was deployed via
+`scp`+`mv` to `~/AppImages/dlssnr.appimage` (a plain, unversioned filename) under
+the assumption that was "the" app. It is not. The real, actually-integrated,
+desktop-launched app is `~/AppImages/dlssnr.appimage_0_1_25.appimage` --
+confirmed via its own `~/.local/share/applications/dlssnr.appimage_0_1_25.desktop`
+launcher entry (`Exec=`/`TryExec=` both point at that exact versioned filename,
+`X-AppImage-Version=0.1.25`). Gear Lever (`it.mijorus.gearlever`, installed as a
+Flatpak) is what created this versioned-filename-plus-desktop-file pair when Alex
+originally integrated the AppImage through it; a raw `scp`+`mv` to a *different*
+path is invisible to it entirely. The two files are completely independent
+(different inodes, different content) -- overwriting the wrong one all session
+meant every GUI/CLI-level fix (the console-window fix, the orphaned-helper
+`stop()` fix) never reached what Alex's own desktop icon actually launches, only
+what this project's own manual SSH-based testing exercised. **This did not affect
+the real game-visible fixes** (the NGX/color-channel work) -- those deploy the
+Vulkan layer `.so` to a separate, always-correct path
+(`~/.local/share/dlssnr/lib/libdlssnr_layer.so`, see the "Real-machine deploy
+gotcha" section) that the game loads directly via its own Vulkan manifest,
+independent of which GUI binary exists or which version it reports.
+
+**Found via a real user report, not inspection**: "you broke something because I
+cannot update dlssnr using gear lever" -- Gear Lever's own "check for updates" ran
+against the real `dlssnr.appimage_0_1_25.appimage` and reported nothing newer,
+despite v0.1.29 genuinely existing on GitHub. Investigation found two real,
+separate problems: (1) this deployment mistake, meaning the *managed* file itself
+had never moved past a build old enough to matter less, and (2) a real, separate
+bug in `build-appimage.sh` itself -- see below.
+
+**The `build-appimage.sh` bug, fixed**: `UPDATE_INFORMATION` embedded
+`gh-releases-zsync|labj1987|Dlssnr|latest|...` (capital `D`) as the GitHub repo to
+check -- the real repo is `labj1987/dlssnr` (lowercase). `gh api
+repos/labj1987/Dlssnr/...` resolves this fine (GitHub's own API/web layer handles
+the case mismatch), so this looked like it might be a red herring at first -- but
+Gear Lever's own update-check client apparently does *not* handle it the same way,
+matching the exact real symptom reported ("no updates found") rather than a
+visible error. Fixed to match the repo's real casing exactly rather than relying
+on any client's redirect behavior. Also gave `zsyncmake` a real, absolute `-u
+<url>` (this exact release's GitHub download URL) instead of letting it default to
+a bare relative filename in the `.zsync`'s own internal "URL:" header -- separate
+metadata from `UPDATE_INFORMATION`, used by whatever client downloads the actual
+new bytes once an update is found.
+
+**What v0.1.30 actually fixes, precisely**: the corrected `UPDATE_INFORMATION`/
+zsync-URL metadata is embedded in *this* release's own AppImage. For Gear Lever to
+ever find it (or any future release) automatically, the *currently-managed* file
+(`dlssnr.appimage_0_1_25.appimage`) needs to actually become a build that carries
+this fix -- simply publishing v0.1.30 to GitHub does not retroactively fix what
+the stale 0.1.25 file already has embedded. Check what was actually done to
+`dlssnr.appimage_0_1_25.appimage` in this session's own real actions (in-place
+content replacement, preserving the filename/desktop-entry Gear Lever already
+knows about, was the plan discussed with Alex) before assuming Gear Lever's
+update flow "just works" from here on without verifying it for real.
+
+**Lesson for next time, plainly**: when deploying anything meant to reach a real
+user-facing app on `lordnikon`, find out how that app is *actually* installed and
+launched first (check `~/.local/share/applications/*.desktop` for the real
+`Exec=` path) rather than assuming a plausible-looking file path is the right
+target. This cost an entire session's worth of GUI/CLI-level fixes never reaching
+the user until they happened to try updating and noticed.
