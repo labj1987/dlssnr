@@ -30,6 +30,7 @@ pub struct CompositionSettings {
     pub max_ratio: f32,
     pub debug_view: u32,
     pub apply_model: bool,
+    pub neural_enabled: bool,
 }
 
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
@@ -150,6 +151,7 @@ impl ShmClient {
             max_ratio: f32::from_bits(hdr.max_ratio_bits.load(Ordering::Relaxed)),
             debug_view: hdr.debug_view.load(Ordering::Relaxed),
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
+            neural_enabled: hdr.neural_enabled(),
         })
     }
 

@@ -46,6 +46,9 @@ struct PushConstants {
     colour_strength: f32,
     transfer_strength: f32,
     max_ratio: f32,
+    /// Matches `compose.comp`'s own `params.bgr_order` field exactly (same offset,
+    /// same 4-byte size as the `f32`s above it -- no padding to worry about).
+    bgr_order: u32,
 }
 
 struct Image {
@@ -350,7 +353,8 @@ impl ComposeSlot {
     ///
     /// # Safety
     /// `self.cmd` must already be recording.
-    unsafe fn record_upload_and_compute(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, frame_bytes: u64, colour_strength: f32, transfer_strength: f32, max_ratio: f32) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_upload_and_compute(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, frame_bytes: u64, colour_strength: f32, transfer_strength: f32, max_ratio: f32, bgr_order: bool) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let region = |offset| image_copy_region(width, height, offset);
         // SAFETY: `self.cmd` is recording (forwarded from this function's own
@@ -377,7 +381,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -703,6 +707,7 @@ impl GpuCompose {
         colour_strength: f32,
         transfer_strength: f32,
         max_ratio: f32,
+        bgr_order: bool,
     ) -> bool {
         // SAFETY: `physical_device` is the device this instance was created against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -718,7 +723,20 @@ impl GpuCompose {
             return false;
         }
         // SAFETY: `self.sync.cmd` was just begun above.
-        unsafe { self.sync.record_upload_and_compute(device, self.pipeline, self.pipeline_layout, width, height, frame_bytes, colour_strength, transfer_strength, max_ratio) };
+        unsafe {
+            self.sync.record_upload_and_compute(
+                device,
+                self.pipeline,
+                self.pipeline_layout,
+                width,
+                height,
+                frame_bytes,
+                colour_strength,
+                transfer_strength,
+                max_ratio,
+                bgr_order,
+            )
+        };
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
             return false;
         }
@@ -759,9 +777,14 @@ impl GpuCompose {
     /// channel-swizzle, so it would silently corrupt colors if `target_image`'s real
     /// format ever differs from this module's own hardcoded `FORMAT` -- e.g. a real
     /// `B8G8R8A8` swapchain vs. this module's `R8G8B8A8`. A buffer-to-image copy has no
-    /// such format attached to the source, so it is always correct regardless of what
-    /// `target_image`'s real format turns out to be, the same reasoning `capture.rs`'s
-    /// own original stage 2 already relied on.
+    /// format attached to the source either, so it's exactly as agnostic to a *size*/
+    /// layout mismatch, the same reasoning `capture.rs`'s own original stage 2 already
+    /// relied on. **This does NOT make channel order automatically correct, though**
+    /// (a real, confirmed bug this comment used to claim otherwise about, 2026-09-11):
+    /// the bytes in that buffer are only correct for `target_image`'s real component
+    /// order because the shader itself now swizzles its output based on `bgr_order`
+    /// (see `compose.comp`'s `params.bgr_order` doc comment) -- the buffer copy's own
+    /// format-obliviousness was never the thing making this correct.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_into_image(
         &mut self,
@@ -776,6 +799,7 @@ impl GpuCompose {
         colour_strength: f32,
         transfer_strength: f32,
         max_ratio: f32,
+        bgr_order: bool,
         target_image: vk::Image,
     ) -> bool {
         // SAFETY: `physical_device` is the device this instance was created against.
@@ -793,7 +817,18 @@ impl GpuCompose {
         }
         // SAFETY: `self.sync.cmd` was just begun above.
         unsafe {
-            self.sync.record_upload_and_compute(device, self.pipeline, self.pipeline_layout, width, height, frame_bytes, colour_strength, transfer_strength, max_ratio);
+            self.sync.record_upload_and_compute(
+                device,
+                self.pipeline,
+                self.pipeline_layout,
+                width,
+                height,
+                frame_bytes,
+                colour_strength,
+                transfer_strength,
+                max_ratio,
+                bgr_order,
+            );
             self.sync.record_copy_into_image(device, width, height, frame_bytes, target_image);
         }
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
@@ -859,6 +894,7 @@ impl GpuCompose {
         colour_strength: f32,
         transfer_strength: f32,
         max_ratio: f32,
+        bgr_order: bool,
         target_image: vk::Image,
     ) -> Option<vk::Semaphore> {
         let idx = self.next_async_slot;
@@ -891,7 +927,18 @@ impl GpuCompose {
         }
         // SAFETY: `async_slot.slot.cmd` was just begun above.
         unsafe {
-            async_slot.slot.record_upload_and_compute(device, self.pipeline, self.pipeline_layout, width, height, frame_bytes, colour_strength, transfer_strength, max_ratio);
+            async_slot.slot.record_upload_and_compute(
+                device,
+                self.pipeline,
+                self.pipeline_layout,
+                width,
+                height,
+                frame_bytes,
+                colour_strength,
+                transfer_strength,
+                max_ratio,
+                bgr_order,
+            );
             async_slot.slot.record_copy_into_image(device, width, height, frame_bytes, target_image);
         }
         if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() {
@@ -1010,11 +1057,11 @@ mod tests {
         let (colour_strength, transfer_strength, max_ratio) = (0.7, 0.8, 2.0);
 
         let mut gpu_result = model_answer.clone();
-        let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio);
+        let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio, false);
         assert!(ok, "GpuCompose::dispatch returned false");
 
         let mut cpu_result = model_answer.clone();
-        super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0);
+        super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, false);
 
         let mut max_diff = 0i32;
         for (g, c) in gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4)) {
@@ -1023,6 +1070,107 @@ mod tests {
             }
         }
         assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} (expected <= 3): gpu={gpu_result:?} cpu={cpu_result:?}");
+
+        // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
+        // is in flight; nothing else references `device`/`instance`.
+        unsafe {
+            gpu.destroy(&device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes() {
+        // Real regression test for the 2026-09-11 channel-swap bug: feeds the exact
+        // same semantic colors as `gpu_dispatch_matches_the_cpu_reference` above, but
+        // with R and B physically swapped in the byte layout (simulating a real
+        // `B8G8R8A8` swapchain) and `bgr_order: true` on every call. If the swizzle in
+        // `compose.comp`/`apply_rgba8` is correct, the *true* colors this produces
+        // (read back through the swapped indices) must match `gpu_dispatch_matches_
+        // the_cpu_reference`'s own RGB-order result exactly -- not just GPU agreeing
+        // with CPU (both could be equally wrong the same way), but this whole
+        // BGR-order run agreeing with that separate, independently-computed RGB-order
+        // run.
+        let Some((_entry, instance, physical_device, device, queue, _queue_family)) = test_device() else {
+            eprintln!("bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let Some(mut gpu) = GpuCompose::new(&device, 0) else {
+            eprintln!("bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes: GpuCompose::new failed, skipping");
+            // SAFETY: nothing was created past the device/instance.
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
+            return;
+        };
+
+        let (width, height) = (8u32, 8u32);
+        let pixel_count = (width * height) as usize;
+        // Same true colors as `gpu_dispatch_matches_the_cpu_reference`, but stored
+        // B,G,R,A -- swap index 0 and 2 relative to that test's own byte arrays.
+        let original_bgr: Vec<u8> = (0..pixel_count)
+            .flat_map(|i| {
+                let t = (i * 37 % 256) as u8;
+                [t.wrapping_add(128), t.wrapping_add(64), t, 255]
+            })
+            .collect();
+        let model_answer_bgr: Vec<u8> = (0..pixel_count)
+            .flat_map(|i| {
+                let t = (i * 53 % 256) as u8;
+                [t.wrapping_add(200), t, t.wrapping_add(20), 255]
+            })
+            .collect();
+
+        let (colour_strength, transfer_strength, max_ratio) = (0.7, 0.8, 2.0);
+
+        let mut gpu_result = model_answer_bgr.clone();
+        let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original_bgr, &mut gpu_result, colour_strength, transfer_strength, max_ratio, true);
+        assert!(ok, "GpuCompose::dispatch returned false");
+
+        let mut cpu_result = model_answer_bgr.clone();
+        super::super::apply::apply_rgba8(&original_bgr, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, true);
+
+        // GPU and CPU must still agree with each other under bgr_order too.
+        let mut max_diff = 0i32;
+        for (g, c) in gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4)) {
+            for ch in 0..3 {
+                max_diff = max_diff.max((i32::from(g[ch]) - i32::from(c[ch])).abs());
+            }
+        }
+        assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} under bgr_order=true (expected <= 3)");
+
+        // The true colors (read back through the swapped R/B indices) must match
+        // `gpu_dispatch_matches_the_cpu_reference`'s own RGB-order CPU result exactly
+        // -- proving the swizzle round-trips correctly end to end, not just that GPU
+        // and CPU are consistently wrong the same way.
+        let original_rgb: Vec<u8> = (0..pixel_count)
+            .flat_map(|i| {
+                let t = (i * 37 % 256) as u8;
+                [t, t.wrapping_add(64), t.wrapping_add(128), 255]
+            })
+            .collect();
+        let model_answer_rgb: Vec<u8> = (0..pixel_count)
+            .flat_map(|i| {
+                let t = (i * 53 % 256) as u8;
+                [t.wrapping_add(20), t, t.wrapping_add(200), 255]
+            })
+            .collect();
+        let mut reference_rgb = model_answer_rgb.clone();
+        super::super::apply::apply_rgba8(&original_rgb, &mut reference_rgb, colour_strength, transfer_strength, max_ratio, 0, false);
+
+        for (px_bgr, px_rgb_ref) in gpu_result.chunks_exact(4).zip(reference_rgb.chunks_exact(4)) {
+            // px_bgr is [B, G, R, A] -- reorder to true [R, G, B] before comparing.
+            let true_rgb = [px_bgr[2], px_bgr[1], px_bgr[0]];
+            let reference = [px_rgb_ref[0], px_rgb_ref[1], px_rgb_ref[2]];
+            for ch in 0..3 {
+                assert!(
+                    (i32::from(true_rgb[ch]) - i32::from(reference[ch])).abs() <= 3,
+                    "bgr_order=true's true colors {true_rgb:?} must match the independent RGB-order reference {reference:?}"
+                );
+            }
+        }
 
         // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
         // is in flight; nothing else references `device`/`instance`.
@@ -1057,7 +1205,7 @@ mod tests {
             let pixel_count = (width * height) as usize;
             let original = vec![128u8; pixel_count * 4];
             let mut answer = vec![100u8; pixel_count * 4];
-            let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut answer, 1.0, 1.0, 2.0);
+            let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut answer, 1.0, 1.0, 2.0, false);
             assert!(ok, "dispatch failed at {width}x{height}");
         }
 
@@ -1166,7 +1314,7 @@ mod tests {
 
         // The reference: `dispatch`'s already-verified CPU-visible path.
         let mut expected = model_answer.clone();
-        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio));
+        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio, false));
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -1181,7 +1329,7 @@ mod tests {
         let mut model_answer_for_direct = model_answer.clone();
         let ok = gpu.dispatch_into_image(
             &device, &instance, physical_device, queue, width, height, &original, &mut model_answer_for_direct,
-            colour_strength, transfer_strength, max_ratio, target.image,
+            colour_strength, transfer_strength, max_ratio, false, target.image,
         );
         assert!(ok, "dispatch_into_image returned false");
 
@@ -1226,7 +1374,7 @@ mod tests {
         let (colour_strength, transfer_strength, max_ratio) = (0.5, 1.0, 2.0);
 
         let mut expected = model_answer.clone();
-        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio));
+        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio, false));
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -1237,7 +1385,7 @@ mod tests {
 
         let sem = gpu.dispatch_into_image_async(
             &device, &instance, physical_device, queue, width, height, &original, &model_answer,
-            colour_strength, transfer_strength, max_ratio, target.image,
+            colour_strength, transfer_strength, max_ratio, false, target.image,
         );
         let Some(sem) = sem else { panic!("dispatch_into_image_async returned None") };
 
@@ -1302,7 +1450,7 @@ mod tests {
         for i in 0..(ASYNC_SLOTS * 3 + 1) {
             let target = make_target_image(&device, &mem_props, width, height);
             transition_to_present_src(&device, queue, pool, target.image);
-            let sem = gpu.dispatch_into_image_async(&device, &instance, physical_device, queue, width, height, &original, &model_answer, 1.0, 1.0, 2.0, target.image);
+            let sem = gpu.dispatch_into_image_async(&device, &instance, physical_device, queue, width, height, &original, &model_answer, 1.0, 1.0, 2.0, false, target.image);
             let Some(sem) = sem else { panic!("dispatch_into_image_async returned None on iteration {i}") };
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
             let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;

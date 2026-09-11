@@ -359,6 +359,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let width = sw.width;
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
+                let bgr_order = swapchain::is_bgr_order(sw.format);
                 let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, .. } = &mut *state;
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
@@ -389,6 +390,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                             width,
                             height,
                             proxy_format,
+                            bgr_order,
                             capture,
                             gpu_compose,
                             shm,

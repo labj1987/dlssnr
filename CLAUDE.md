@@ -1374,3 +1374,70 @@ before running any Proton/Wine command against a prefix you don't manage, check
 that prefix's own `version` file and use the exact same build; afterward, verify no
 process is still alive with that `WINEPREFIX` in its environment, not just that the
 outer command returned.
+
+## Real red/blue channel swap on any `B8G8R8A8` swapchain -- FIXED (2026-09-11),
+## found from a live user report during real gameplay with NGX finally working
+
+Reported live, in real time, while playing GTA San Andreas with the NGX fix above
+active: "getting flickering and it doesn't look like games when dlss5 is turned on."
+Root cause, confirmed and fixed the same session -- **not related to the NGX
+platform-error fix above at all**, a completely separate, pre-existing bug that
+simply had no way to surface visually until NGX actually started working.
+
+**What was wrong**: `vkCmdCopyImageToBuffer`/`vkCmdCopyBufferToImage` are raw,
+format-preserving byte copies -- Vulkan never reorders channels during a copy, only
+during a `vkCmdBlitImage` or a sampled (not storage) image read. This project's own
+code (`swapchain::proxy_format_for`, `composition/apply.rs`'s CPU path,
+`shaders/compose.comp`'s GPU path, and `dump.rs`'s debug PNG writer) all hardcoded an
+`R,G,B,A` byte order for every 8-bit-per-channel format, on the reasoning that both
+`R8G8B8A8` and `B8G8R8A8` are "4 bytes/pixel" (true for *size*, false for *channel
+order*). This machine's real swapchain -- confirmed via real `vkcube` and real game
+testing, not assumed -- is `B8G8R8A8_UNORM`, so every captured/composited/presented
+pixel had its red and blue channels silently swapped. Confirmed visually via a real
+`dlssnr-cli shmctl capture` dump during the live session: a uniform blue tint across
+the *entire* frame (walls, character skin, everything), present identically in both
+the "original" (pre-model) and "composited" dumps -- proving the swap happened
+upstream of the model/composition math, not because of anything the model itself
+produced.
+
+**The fix**: `swapchain::is_bgr_order(format)` (new) detects the real channel order;
+a `bgr_order: bool` now threads through the whole capture/composition pipeline --
+`capture::run`/`run_sync`, `composition::apply::apply_rgba8` (swaps the R/B *byte
+indices* it reads/writes, not the pixel math itself, which only ever deals in clean
+`[r,g,b]` triples), `composition::gpu`'s three `dispatch*` functions and their shared
+`PushConstants`, and `shaders/compose.comp` (a new `bgr_order` push-constant field,
+swizzling `.bgr` on `imageLoad` and again on the final `imageStore` -- recompiled
+with `glslangValidator`/validated with `spirv-val`, both confirmed available on this
+dev machine as of this session), and `dump.rs`'s PNG writer. Two doc comments in
+`composition/gpu.rs` that had asserted a buffer-mediated write-back is "correct
+regardless of the real image format" were corrected -- true for size/layout
+compatibility, false for channel order, exactly the bug this section documents.
+
+**Verified for real, not just "compiles"**: a new, deliberately strict test
+(`composition::gpu::tests::bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes`)
+feeds the exact same semantic colors as the existing `gpu_dispatch_matches_the_cpu_reference`
+test, but physically stored in swapped (BGR) byte order with `bgr_order: true`, and
+asserts the *true* colors this produces (read back through the swapped indices)
+match that separate, independently-computed RGB-order run's result -- not just that
+the GPU and CPU paths agree with each other (which they could do while both being
+consistently wrong the same way, exactly as they were before this fix). Full
+workspace test suite (34 layer tests) stays green.
+
+**Known, deferred, separate gap**: `crates/helper/src/frame.rs`'s `COLOR_FORMAT`
+(the NGX `DLSSNR.Color`/`.Output` Vulkan resource format) is still hardcoded
+`R8G8B8A8_UNORM` regardless of the real captured format -- this fix corrects what
+the *layer* captures, composites, and presents, but the model itself may still
+receive/produce mislabeled color data on a real `B8G8R8A8` swapchain. Fixing this
+properly means threading the real channel order through the SHM protocol (a new
+header field, a `SHM_VERSION` bump per `header.rs`'s own discipline) so `frame.rs`
+can create its Color/Output images with the real matching `vk::Format` instead of a
+hardcoded constant. Not yet done -- the visual symptom reported this session (a
+uniform blue tint matching a pure channel swap, not a subtler model-confusion
+artifact) was consistent enough with the layer-side bug alone that fixing it first
+and re-checking with real gameplay was the right next step, not assuming both gaps
+needed fixing before shipping anything.
+
+**Also fixed the same session, unrelated**: the GUI's "Enabled" toggle
+(`ShmHeader::enabled`, `neural_enabled()`) was never actually read by the capture
+path at all -- turning it off in the GUI had no effect on anything real. Now gates
+`capture::run` the same way `apply_model` already does.

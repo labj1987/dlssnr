@@ -45,6 +45,16 @@ layout(push_constant) uniform Params {
   float colour_strength;   // 0 = luminance-only, 1 = fully hue-corrected
   float transfer_strength; // 0 = original frame untouched, 1 = full transfer
   float max_ratio;         // clamp on the rescale ratio (near-black proxy guard)
+  // Non-zero when the real captured/answer bytes uploaded into u_original/u_proxy/
+  // u_model_answer are B,G,R,A order (a real B8G8R8A8 swapchain), not R,G,B,A --
+  // these storage images are always declared `rgba8` above regardless (GLSL/SPIR-V
+  // storage image formats have no separate BGR variant), so a BGR-order upload's
+  // "red" slot is really blue and vice versa. Found 2026-09-11: this shader's own
+  // math was silently reading/writing swapped channels on real hardware (this
+  // machine's real swapchain format), producing a visible, uniform blue tint on
+  // every composited frame -- see `swapchain::is_bgr_order`'s doc comment (Rust
+  // side) for the full story.
+  uint bgr_order;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -177,10 +187,14 @@ void main() {
 
   // `rgba8` storage-image loads are raw normalized bytes, no sRGB curve applied by
   // the hardware -- decode to linear light explicitly, same as
-  // `composition::apply::compose_pixel`'s own `srgb_decode` calls.
-  vec3 original = SrgbDecode(imageLoad(u_original, pixel).rgb);
-  vec3 proxy = SrgbDecode(imageLoad(u_proxy, pixel).rgb);
-  vec3 model = SrgbDecode(imageLoad(u_model_answer, pixel).rgb);
+  // `composition::apply::compose_pixel`'s own `srgb_decode` calls. `.bgr` swizzles
+  // the loaded components back into true RGB order first when the real upload was
+  // BGR order (see `params.bgr_order`'s doc comment) -- everything below this point
+  // only ever deals in canonical `[r, g, b]`.
+  bool bgr = params.bgr_order != 0u;
+  vec3 original = SrgbDecode(bgr ? imageLoad(u_original, pixel).bgr : imageLoad(u_original, pixel).rgb);
+  vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, pixel).bgr : imageLoad(u_proxy, pixel).rgb);
+  vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
 
   vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
   // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a
@@ -193,5 +207,10 @@ void main() {
   vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
   vec3 result = GamutCompressReversible(blended);
 
-  imageStore(u_output, pixel, vec4(SrgbEncode(result), 1.0));
+  vec3 encoded = SrgbEncode(result);
+  // Swizzle back to the real upload order before storing -- `u_output`'s bytes get
+  // copied verbatim (no reformatting) into the real swapchain image afterward, so
+  // they must already be in that image's true B,G,R,A order when the swapchain is
+  // BGR, not canonical R,G,B,A.
+  imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, 1.0));
 }

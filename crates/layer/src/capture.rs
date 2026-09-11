@@ -279,6 +279,7 @@ pub unsafe fn run(
     width: u32,
     height: u32,
     proxy_format: u32,
+    bgr_order: bool,
     resources: &mut Option<CaptureResources>,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
@@ -319,6 +320,7 @@ pub unsafe fn run(
                 width,
                 height,
                 proxy_format,
+                bgr_order,
                 resources,
                 gpu_compose,
                 shm,
@@ -332,7 +334,11 @@ pub unsafe fn run(
     // `ShmClient::model_known_unavailable`'s own doc comment already covers. Either
     // way, paying for a capture+round-trip cycle nobody will use is pure waste;
     // skip the whole pipeline and let the caller present `image` untouched.
-    if !settings.apply_model || shm.model_known_unavailable() {
+    // `neural_enabled` (the GUI's own "Enabled" toggle, `ShmHeader::enabled`) is
+    // included here too -- a real bug, found 2026-09-11: `ShmHeader::neural_enabled()`
+    // existed and the GUI wrote to it, but nothing in this crate ever read it back,
+    // so turning "Enabled" off in the GUI had no effect on anything real at all.
+    if !settings.apply_model || !settings.neural_enabled || shm.model_known_unavailable() {
         return None;
     }
 
@@ -407,6 +413,7 @@ pub unsafe fn run(
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
+            bgr_order,
             image,
         ) {
             return Some(sem);
@@ -426,6 +433,7 @@ pub unsafe fn run(
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
+            bgr_order,
             image,
         ) {
             return None;
@@ -442,6 +450,7 @@ pub unsafe fn run(
         settings.transfer_strength,
         settings.max_ratio,
         0,
+        bgr_order,
     );
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
         return None;
@@ -683,6 +692,7 @@ unsafe fn run_sync(
     width: u32,
     height: u32,
     proxy_format: u32,
+    bgr_order: bool,
     resources: &mut Option<CaptureResources>,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
@@ -876,6 +886,7 @@ unsafe fn run_sync(
                                     settings.colour_strength,
                                     settings.transfer_strength,
                                     settings.max_ratio,
+                                    bgr_order,
                                     image,
                                 );
                             }
@@ -894,6 +905,7 @@ unsafe fn run_sync(
                                     settings.colour_strength,
                                     settings.transfer_strength,
                                     settings.max_ratio,
+                                    bgr_order,
                                 );
                             }
                         }
@@ -906,6 +918,7 @@ unsafe fn run_sync(
                             settings.transfer_strength,
                             settings.max_ratio,
                             settings.debug_view,
+                            bgr_order,
                         );
                     }
                 } else {
@@ -952,7 +965,7 @@ unsafe fn run_sync(
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
         let current = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
-        crate::dump::write_pair(&original, current, width, height);
+        crate::dump::write_pair(&original, current, width, height, bgr_order);
     }
 
     // Stage 2: staging buffer (now holding the answer, if there was one -- otherwise
@@ -1200,6 +1213,7 @@ mod tests {
                     width,
                     height,
                     proxy_format,
+                    false,
                     &mut resources,
                     &mut gpu_compose,
                     &mut shm,

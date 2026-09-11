@@ -37,7 +37,15 @@ use super::color;
 /// must not call this for any other `proxy_format`. A length mismatch processes
 /// whichever is shorter and leaves the rest of `answer` untouched, rather than
 /// panicking (fails open, same discipline as the rest of this crate's capture path).
-pub fn apply_rgba8(original: &[u8], answer: &mut [u8], colour_strength: f32, transfer_strength: f32, max_ratio: f32, debug_view: u32) {
+pub fn apply_rgba8(
+    original: &[u8],
+    answer: &mut [u8],
+    colour_strength: f32,
+    transfer_strength: f32,
+    max_ratio: f32,
+    debug_view: u32,
+    bgr_order: bool,
+) {
     if debug_view == 2 {
         return;
     }
@@ -74,18 +82,26 @@ pub fn apply_rgba8(original: &[u8], answer: &mut [u8], colour_strength: f32, tra
     std::thread::scope(|scope| {
         for (orig_chunk, ans_chunk) in original[..n].chunks(chunk_bytes).zip(answer[..n].chunks_mut(chunk_bytes)) {
             scope.spawn(move || {
+                // `original`/`answer` are raw captured/model bytes -- B,G,R,A order for
+                // a `B8G8R8A8` swapchain, R,G,B,A for `R8G8B8A8` (see
+                // `swapchain::is_bgr_order`'s doc comment for why this matters and how
+                // it was found). Read/write through the real R/B slot indices so
+                // `compose_pixel`'s own math -- which only ever deals in canonical
+                // `[r, g, b]` triples -- never has to know which order the bytes came
+                // in.
+                let (r, b) = if bgr_order { (2, 0) } else { (0, 2) };
                 for (orig_px, ans_px) in orig_chunk.chunks_exact(4).zip(ans_chunk.chunks_exact_mut(4)) {
                     let new_pixel = compose_pixel(
-                        [orig_px[0], orig_px[1], orig_px[2]],
-                        [ans_px[0], ans_px[1], ans_px[2]],
+                        [orig_px[r], orig_px[1], orig_px[b]],
+                        [ans_px[r], ans_px[1], ans_px[b]],
                         colour_strength,
                         transfer_strength,
                         max_ratio,
                         debug_view,
                     );
-                    ans_px[0] = new_pixel[0];
+                    ans_px[r] = new_pixel[0];
                     ans_px[1] = new_pixel[1];
-                    ans_px[2] = new_pixel[2];
+                    ans_px[b] = new_pixel[2];
                     // ans_px[3] (alpha): left as whatever the model's answer already had.
                 }
             });
@@ -163,7 +179,7 @@ mod tests {
         let original = solid_rgba8([200, 50, 50], 2, 2);
         let mut answer = solid_rgba8([10, 240, 10], 2, 2);
         let before = answer.clone();
-        apply_rgba8(&original, &mut answer, 1.0, 1.0, 2.0, 2);
+        apply_rgba8(&original, &mut answer, 1.0, 1.0, 2.0, 2, false);
         assert_eq!(answer, before, "debug_view=2 must leave the raw model answer untouched");
     }
 
@@ -171,7 +187,7 @@ mod tests {
     fn debug_view_1_replaces_answer_with_original() {
         let original = solid_rgba8([200, 50, 50], 2, 2);
         let mut answer = solid_rgba8([10, 240, 10], 2, 2);
-        apply_rgba8(&original, &mut answer, 1.0, 1.0, 2.0, 1);
+        apply_rgba8(&original, &mut answer, 1.0, 1.0, 2.0, 1, false);
         assert_eq!(answer, original, "debug_view=1 must show the original/proxy, not the model's answer");
     }
 
@@ -182,7 +198,7 @@ mod tests {
         // the blend itself, not dependent on `upgrade_tone_map`'s own correctness.
         let original = solid_rgba8([180, 90, 30], 2, 2);
         let mut answer = solid_rgba8([5, 5, 200], 2, 2);
-        apply_rgba8(&original, &mut answer, 1.0, 0.0, 2.0, 0);
+        apply_rgba8(&original, &mut answer, 1.0, 0.0, 2.0, 0, false);
         for (o, a) in original.chunks_exact(4).zip(answer.chunks_exact(4)) {
             for c in 0..3 {
                 assert!((i32::from(o[c]) - i32::from(a[c])).abs() <= 1, "expected ~original at transfer_strength=0, got {a:?} vs {o:?}");
@@ -198,7 +214,7 @@ mod tests {
         // the whole pipeline should reproduce `original` to within 8-bit rounding.
         let same = solid_rgba8([160, 120, 40], 2, 2);
         let mut answer = same.clone();
-        apply_rgba8(&same, &mut answer, 1.0, 1.0, 2.0, 0);
+        apply_rgba8(&same, &mut answer, 1.0, 1.0, 2.0, 0, false);
         for (o, a) in same.chunks_exact(4).zip(answer.chunks_exact(4)) {
             for c in 0..3 {
                 assert!((i32::from(o[c]) - i32::from(a[c])).abs() <= 1, "expected ~identity, got {a:?} vs {o:?}");

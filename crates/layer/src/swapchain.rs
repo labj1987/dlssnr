@@ -65,6 +65,24 @@ pub fn proxy_format_for(format: vk::Format) -> u32 {
     }
 }
 
+/// Whether `format`'s real per-texel byte order is B,G,R,A rather than R,G,B,A --
+/// `proxy_format_for` collapses both into the same `RGBA8` proxy format (a real,
+/// correct simplification for *size*: both are 4 bytes/pixel), but every consumer of
+/// the captured bytes (composition math, the debug PNG dump, the NGX model's own
+/// resource binding) needs the real channel order too, or it silently reads/writes
+/// red and blue swapped. Found and fixed 2026-09-11: `vkCmdCopyImageToBuffer`/
+/// `vkCmdCopyBufferToImage` are raw, format-preserving byte copies -- they never
+/// reorder channels -- so a `B8G8R8A8` swapchain (confirmed via real `vkcube`/game
+/// testing to be what this machine's driver actually hands out, not a hypothetical)
+/// produced bytes that every downstream consumer, hardcoded to assume `R8G8B8A8`
+/// order, silently misread -- a real, visible red/blue channel swap on real hardware,
+/// not a debug-dump-only cosmetic issue (the NGX model's own `DLSSNR.Color`/`.Output`
+/// resources are declared `R8G8B8A8_UNORM` in `crates/helper/src/frame.rs`, so it
+/// received/produced genuinely mislabeled color data too).
+pub fn is_bgr_order(format: vk::Format) -> bool {
+    matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB)
+}
+
 /// What a swapchain's format and colour space together say about the light in the
 /// frame. A float swapchain hands over linear light directly. A ten-bit swapchain in an
 /// HDR10/PQ colour space carries ST 2084 code -- absolute nits, not just more precision

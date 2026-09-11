@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.26 — 2026-09-11
+
+- **Fixed a real red/blue channel swap affecting every real game session**,
+  reported live as "flickering... doesn't look like the game" while running
+  GTA San Andreas with DLSS 5 NR on. Root cause: `vkCmdCopyImageToBuffer`/
+  `vkCmdCopyBufferToImage` are raw, format-preserving byte copies — they never
+  reorder channels — but this project's own code (`swapchain::proxy_format_for`,
+  the composition math in `composition/apply.rs` and `shaders/compose.comp`,
+  and the debug PNG dump) all hardcoded an `R,G,B,A` byte order regardless of
+  the swapchain's real format. This machine's real swapchain (and this game's)
+  is `B8G8R8A8_UNORM` — confirmed via real `vkcube`/game testing, not
+  hypothetical — so every captured/composited/presented byte had red and blue
+  silently swapped, visible as a uniform blue tint across real captured
+  frames. Fixed by threading a real `bgr_order: bool` (from
+  `swapchain::is_bgr_order`, new) through the whole capture/composition
+  pipeline — both the CPU path (`apply_rgba8`) and the GPU compute path
+  (`compose.comp`, recompiled with a new `bgr_order` push constant) now read
+  and write through the correct channel indices. A real, deliberately strict
+  regression test (`bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes`)
+  verifies the *true* colors this produces match an independently-computed
+  RGB-order reference exactly, not just that the GPU and CPU paths agree with
+  each other (which they could do while both being equally wrong).
+- Corrected two doc comments in `composition/gpu.rs` that had asserted a
+  buffer-mediated write-back is "correct regardless of the real image format" —
+  true for size/layout compatibility, false for channel order, which is
+  exactly what caused the bug above.
+- **Fixed a second, unrelated real bug found while investigating the above**:
+  the GUI's "Enabled" toggle (`ShmHeader::enabled`, read via
+  `ShmHeader::neural_enabled()`) was never actually checked by the capture
+  path at all — turning it off in the GUI had no effect on anything. Now
+  gates `capture::run` the same way `apply_model` already does.
+- The NGX model's own `DLSSNR.Color`/`.Output` Vulkan resources
+  (`crates/helper/src/frame.rs`) are still hardcoded `R8G8B8A8_UNORM`
+  regardless of the real captured format — a real, separate, deferred gap:
+  the model itself may still receive/produce mislabeled color data on a BGR
+  swapchain, independent of the fix above (which corrects what the *layer*
+  captures, composites, and presents). Not yet fixed; see CLAUDE.md.
+
 ## 0.1.25 — 2026-09-11
 
 - **Real DLSS 5 Neural Rendering works again, end to end, for the first time since
