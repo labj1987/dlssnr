@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.27 — 2026-09-11
+
+- **Hid the pointless console window `dlssnr_helper.exe` popped up on every real
+  launch**, reported live: "it doesn't do anything." A plain Rust binary links as a
+  CONSOLE-subsystem PE by default, so Wine allocates and shows one at startup even
+  though this helper never had anything worth reading in it — real deployments
+  always set `DLSSNR_LOG`, so its `Stderr` fallback is already unreachable in
+  practice. Added `#![windows_subsystem = "windows"]` to `crates/helper/src/main.rs`
+  — confirmed via `file` that the rebuilt binary now links `(GUI)` instead of
+  `(console)`, matching upstream's own compiled helper's subsystem type.
+
 ## 0.1.26 — 2026-09-11
 
 - **Fixed a real red/blue channel swap affecting every real game session**,

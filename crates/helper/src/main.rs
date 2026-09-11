@@ -24,6 +24,16 @@
 //! This is a thin wrapper around the `dlssnr_helper` library crate (see `lib.rs`) --
 //! that split exists so `examples/` can exercise individual modules directly.
 
+// Suppresses the console window Wine/Windows would otherwise pop up for this
+// process -- a plain Rust binary links as a CONSOLE-subsystem PE by default, and
+// this helper never has anything to print to one that matters: real deployments
+// always set `DLSSNR_LOG` (`dlssnr_supervisor::start()`, confirmed by grep), so
+// `crate::logging`'s own `Stderr` fallback is already unreachable in practice --
+// see that module's own doc comment. Found real, reported by the user, 2026-09-11:
+// this window shows up on every real launch and does nothing (no input, no output
+// worth reading), purely a side effect of never having set this.
+#![windows_subsystem = "windows"]
+
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
