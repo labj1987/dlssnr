@@ -99,6 +99,22 @@ struct State {
     queue_families: HashMap<vk::Queue, u32>,
     capture: Option<capture::CaptureResources>,
     gpu_compose: Option<crate::composition::gpu::GpuCompose>,
+    /// Reused across frames by `capture::run` for its own pre-edit frame snapshot,
+    /// instead of a fresh `frame_bytes`-sized heap allocation every single present
+    /// call -- see that function's own doc comment on why the snapshot exists at all.
+    /// At 4K RGBA8 that's a ~31.6MiB allocation avoided every frame; measured on
+    /// `lordnikon` (2026-09-10) at ~78ms per fresh allocation+copy, a real, if not
+    /// fully explained (a `perf stat` on the same machine at the same time showed the
+    /// process 97% backend-bound with an IPC of 0.1 -- a severe memory-subsystem
+    /// stall this allocation likely aggravates without being its root cause), cost.
+    original_scratch: Vec<u8>,
+    /// The pipelined redesign's own persistent state -- see `capture::run`'s own doc
+    /// comment for why a round trip's original frame has to outlive the present call
+    /// that sent it, across however many present calls it takes the helper to answer.
+    inflight: capture::Inflight,
+    /// Reused across frames the same way `original_scratch` is, for the answer bytes
+    /// `capture::run` reads back once a round trip resolves.
+    answer_scratch: Vec<u8>,
 }
 
 impl DlssnrDeviceInfo {
@@ -333,7 +349,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let width = sw.width;
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
-                let State { shm, capture, gpu_compose, .. } = &mut *state;
+                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, .. } = &mut *state;
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
@@ -366,6 +382,9 @@ impl DeviceHooks for DlssnrDeviceInfo {
                             capture,
                             gpu_compose,
                             shm,
+                            original_scratch,
+                            inflight,
+                            answer_scratch,
                         );
                     }
                 }

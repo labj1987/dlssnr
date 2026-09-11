@@ -139,10 +139,12 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     };
     if s.snippet.is_null() {
         crate::log!("[ngx] LoadLibraryExW nvngx_dlssnr.dll failed");
+        crate::logging::flush();
         s.disabled = true;
         return s;
     }
     crate::log!("[ngx] nvngx_dlssnr.dll loaded at {:?}", s.snippet);
+    crate::logging::flush();
 
     // SAFETY: `s.snippet` was just confirmed non-null and loaded above.
     unsafe {
@@ -155,22 +157,44 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     if s.create_feature.is_none() || s.evaluate_feature.is_none() || s.release_feature.is_none() || s.shutdown1.is_none()
     {
         crate::log!("[ngx] snippet Vulkan exports incomplete");
+        crate::logging::flush();
         unsafe { FreeLibrary(s.snippet) };
         s.snippet = std::ptr::null_mut();
         s.disabled = true;
         return s;
     }
+    crate::log!("[ngx] snippet Vulkan exports resolved, installing caller-identity spoof next");
+    crate::logging::flush();
 
     // SAFETY: `s.snippet` is a valid, currently-loaded module.
     s.snippet_spoof = unsafe { spoof::install(s.snippet) };
     if s.snippet_spoof.is_none() {
         crate::log!("[ngx] failed to install the caller-identity spoof on the snippet");
+        crate::logging::flush();
         s.disabled = true;
         return s;
     }
+    crate::log!("[ngx] caller-identity spoof installed, loading core (nvngx.dll) next");
+    crate::logging::flush();
 
-    // Core (nvngx.dll) is the preferred parameter allocator; optional, same as
-    // upstream -- a missing or faulting core degrades to the snippet's own allocator.
+    // Core (nvngx.dll) must be loaded for the snippet's own Vulkan exports to resolve
+    // at all -- confirmed via a real bisection on `lordnikon` (2026-09-11): with Core
+    // deliberately kept unloaded, `NVSDK_NGX_VULKAN_AllocateParameters` couldn't be
+    // found via `GetProcAddress` on the snippet either ("no AllocateParameters export
+    // found on core or snippet", matching an identical, independently-observed note
+    // earlier in this same investigation when `nvngx.dll` was genuinely missing from
+    // this machine). That means `nvngx_dlssnr.dll`'s own `NVSDK_NGX_VULKAN_*` exports
+    // are PE forwarders into Core, not a separate implementation -- there is no real
+    // "prefer snippet vs. prefer core" choice to make for this call family; both
+    // resolve to the exact same code either way. (Still resolving from `s.snippet`
+    // first below, since that's harmless and matches how every export above this one
+    // is resolved, but don't mistake it for a meaningful behavior switch.) This also
+    // means the `0xbad00002` (`FAIL_PLATFORM_ERROR`) `AllocateParameters` now returns
+    // (see the doc comment below on why `VULKAN_Init_ProjectID` isn't the cause) is a
+    // real rejection from Core's own NGX runtime, reproduced identically against both
+    // a freshly-recreated Wine prefix and the real, untouched, previously-working game
+    // prefix -- not an environment/prefix difference, and not fixable by choosing a
+    // different module to call through.
     let core_path = utf16(&format!("{bin_dir}\\nvngx.dll"));
     // SAFETY: `core_path` is a valid NUL-terminated UTF-16 string.
     s.core = unsafe {
@@ -180,30 +204,73 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
         )
     };
+    crate::log!("[ngx] core (nvngx.dll) load: {}", if s.core.is_null() { "not found, degrading to snippet allocator" } else { "loaded" });
+    crate::logging::flush();
     if !s.core.is_null() {
         // SAFETY: `s.core` just confirmed non-null.
         s.core_spoof = unsafe { spoof::install(s.core) };
+        crate::log!("[ngx] core caller-identity spoof install: {}", if s.core_spoof.is_some() { "ok" } else { "FAILED (core will see our real caller identity)" });
+        crate::logging::flush();
     }
 
-    let alloc: Option<abi::FnVkAllocateParameters> = if !s.core.is_null() {
-        // SAFETY: `s.core` is a valid, loaded module.
-        unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_AllocateParameters") }
-    } else {
-        None
-    };
-    let alloc = alloc.or_else(|| unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_AllocateParameters") });
-    s.params_destroy = if !s.core.is_null() {
-        unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_DestroyParameters") }
-    } else {
-        None
+    // Deliberately NOT calling `NVSDK_NGX_VULKAN_Init_ProjectID`, even though the DLL
+    // exports it. Upstream's own reverse-engineered notes (extracted_pipeline_notes.md,
+    // section 3.1) show the only *proven* ProjectID-based init route is
+    // `NVSDK_NGX_D3D12_Init_with_ProjectID` against a dedicated D3D12 device -- a
+    // different API family entirely from this helper's Vulkan device; the Vulkan
+    // export exists on the DLL but was never exercised/proven by upstream at all
+    // (section 11: "exists" as an export, not a tested route).
+    //
+    // Real, reproduced evidence this session (2026-09-11, `lordnikon`), not just
+    // theory: calling `VULKAN_Init_ProjectID` against Core returned `0xbad00002`
+    // (`FAIL_PLATFORM_ERROR`). Removing the call entirely was then tested in
+    // isolation -- `AllocateParameters` (see the doc comment above on why it always
+    // resolves to Core's own code regardless of which module you ask) still returns
+    // the identical `0xbad00002` with `VULKAN_Init_ProjectID` never called at all, so
+    // that call was NOT poisoning later calls the way an earlier pass of this
+    // investigation first assumed -- it's simply irrelevant to the real, remaining
+    // rejection. `VULKAN_Init_Ext` (below, snippet-only, no ProjectID involved) is
+    // what every actually-confirmed-working run of this project used (see CLAUDE.md's
+    // "First confirmed neural-rendering success") -- restoring that exact sequence,
+    // not extending it with an unproven call, is what real evidence supports here.
+    // `s.core` stays loaded/spoofed above because it's load-bearing for the snippet's
+    // own exports to resolve at all (see above), not because anything calls into it
+    // directly.
+    if unsafe { resolve_export::<abi::FnVkInitProjectId>(s.snippet, "NVSDK_NGX_VULKAN_Init_ProjectID") }.is_some() {
+        crate::log!("[ngx] VULKAN_Init_ProjectID export present but deliberately not called, see ngx.rs doc comment");
+        crate::logging::flush();
     }
-    .or_else(|| unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_DestroyParameters") });
+
+    // Snippet first, Core only as a fallback -- see the doc comment above `core_path`
+    // for why this order, not Core-first, is the one actually proven to work.
+    // SAFETY: `s.snippet` is a valid, loaded module.
+    let alloc: Option<abi::FnVkAllocateParameters> = unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_AllocateParameters") };
+    let alloc = alloc.or_else(|| {
+        if s.core.is_null() {
+            None
+        } else {
+            // SAFETY: `s.core` just confirmed non-null.
+            unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_AllocateParameters") }
+        }
+    });
+    // SAFETY: `s.snippet` is a valid, loaded module.
+    s.params_destroy = unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_DestroyParameters") }.or_else(|| {
+        if s.core.is_null() {
+            None
+        } else {
+            // SAFETY: `s.core` just confirmed non-null.
+            unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_DestroyParameters") }
+        }
+    });
 
     let Some(alloc) = alloc else {
         crate::log!("[ngx] no AllocateParameters export found on core or snippet");
+        crate::logging::flush();
         s.disabled = true;
         return s;
     };
+    crate::log!("[ngx] calling AllocateParameters now");
+    crate::logging::flush();
     let (alloc_result, seh) = guarded(
         || {
             let mut params: NgxParameter = std::ptr::null_mut();
@@ -216,6 +283,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     );
     let (alloc_code, params) = alloc_result;
     crate::log!("[ngx] AllocateParameters -> {:#x} seh={:#x}", alloc_code as u32, seh);
+    crate::logging::flush();
     if !abi::succeeded(alloc_code) || params.is_null() {
         s.disabled = true;
         return s;
@@ -250,13 +318,17 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             seh,
             test_result.1
         );
+        crate::logging::flush();
     }
 
     let Some(init_ext) = s.init_ext else {
         crate::log!("[ngx] snippet has no VULKAN_Init_Ext export");
+        crate::logging::flush();
         s.disabled = true;
         return s;
     };
+    crate::log!("[ngx] calling VULKAN_Init_Ext now");
+    crate::logging::flush();
     let app_data_path = utf16(&bin_dir);
     let ((init_result,), seh) = guarded(
         || {
@@ -279,6 +351,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         (abi::result::FAIL_SEH,),
     );
     crate::log!("[ngx] VULKAN_Init_Ext -> {:#x} seh={:#x}", init_result as u32, seh);
+    crate::logging::flush();
     if !abi::succeeded(init_result) {
         s.disabled = true;
         return s;

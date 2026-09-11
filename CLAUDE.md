@@ -1217,3 +1217,118 @@ rewritten from the checked-in `./libdlssnr_layer.so` (right for a manifest sitti
 beside the `.so`) to the AppImage's real relative layout
 (`../../lib/dlssnr/libdlssnr_layer.so`) during packaging — check this rewrite still
 matches if the `AppDir` layout ever changes.
+
+## Real-machine deploy gotcha: `~/.local/share/dlssnr/lib/libdlssnr_layer.so` is a
+## SEPARATE, manually-maintained copy on `lordnikon` -- not something the app itself
+## installs (2026-09-10)
+
+Steam launches the game as a completely separate process tree from `dlssnr-gui`, so
+`AppRun`'s `VK_ADD_LAYER_PATH` (scoped to `dlssnr-gui`'s own process tree) never
+reaches it. For the game's own Vulkan loader to find this project's layer at all, a
+*real* implicit-layer manifest has to exist somewhere the loader (or, on this
+machine, Steam Linux Runtime's `pressure-vessel` container, which stages its own
+snapshot of host `implicit_layer.d` entries) actually scans on the host --
+`~/.local/share/vulkan/implicit_layer.d/dlssnr.json`, `"name": "VK_LAYER_dlssnr_neural"`,
+pointing at `~/.local/share/dlssnr/lib/libdlssnr_layer.so`. That manifest and that
+`.so` copy were placed by hand this session; nothing in `crates/gui`, `crates/cli`, or
+`build-appimage.sh` creates, updates, or even references either path -- confirmed by
+grep. **Every time the layer changes, that `.so` has to be copied out by hand** (e.g.
+`scp target/release/libdlssnr_layer.so lordnikon:/tmp/... && ssh lordnikon mv /tmp/...
+~/.local/share/dlssnr/lib/libdlssnr_layer.so` -- `mv` not `cp`, same "Text file busy"
+reasoning as the AppImage itself, since the old `.so` may still be mapped into a
+running game). Rebuilding and redeploying the AppImage alone does **not** update this
+copy. Missing this step burned real time this session: the whole v0.1.17
+buffered-logging fix was built, deployed as an AppImage, and "tested" by restarting
+the game twice, with the game silently loading the stale pre-fix `.so` from this
+separate path the entire time -- the FPS measurement that (falsely) ruled out logging
+as a contributing cause was measuring the *old* code. A real fix belongs here: either
+have `dlssnr-cli`/`dlssnr-gui` install/refresh this real path itself on every launch
+(making it self-healing the way `install_dir.rs` already resolves the *AppImage's own*
+paths), or find why `VK_ADD_LAYER_PATH`/implicit-layer discovery can't reach the game
+process directly and drop this second install location entirely. Not yet done --
+flagged here so it isn't rediscovered the hard way again.
+
+## NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) blocking real DLSS-NR evaluation --
+## CRITICAL, confirmed, NOT YET FIXED (2026-09-11, `lordnikon`)
+
+The core performance/pipelining work (0.1.16-0.1.23) is real, verified, and done --
+see those `CHANGELOG.md` entries. The one remaining real blocker before real NGX
+evaluation works again: every NGX call that touches Core's own implementation now
+returns `0xbad00002` (`FAIL_PLATFORM_ERROR`), where it previously succeeded (see the
+"First confirmed real DLSS 5 Neural Rendering success" section above). **Read this
+section in full before re-investigating** -- most of the obvious hypotheses are
+already ruled out with real evidence, not assumption.
+
+**What's genuinely established, via real bisection on real hardware, not guessed:**
+- `nvngx_dlssnr.dll`'s (the "snippet") own `NVSDK_NGX_VULKAN_*` exports
+  (`AllocateParameters`, at least) are **PE forwarders straight into `nvngx.dll`
+  (Core)** -- confirmed by deliberately keeping Core unloaded and observing
+  `GetProcAddress` fail to resolve the export on the snippet either, with the exact
+  same "no AllocateParameters export found on core or snippet" wording independently
+  seen earlier in this same investigation when `nvngx.dll` was genuinely absent from
+  the machine. **This means there is no real "call it via the snippet instead of
+  Core" workaround for this call family** -- both paths run the identical Core code.
+  Don't waste time trying to route around Core for `AllocateParameters` specifically.
+- `NVSDK_NGX_VULKAN_Init_ProjectID` is **not** the cause, and calling it is **not**
+  "poisoning" later calls -- tested directly: removed the call entirely, confirmed
+  via `cargo check`/rebuild/redeploy that `AllocateParameters` still returns the
+  identical `0xbad00002` with `Init_ProjectID` never invoked at all. `ngx.rs` no
+  longer calls it (removed in 0.1.24), only resolves it diagnostically to log
+  whether the export exists.
+- **Not a prefix/environment difference**, despite how it initially looked. Tested
+  against BOTH a freshly-recreated dlssnr-managed Wine prefix AND the real,
+  untouched, previously-working GTA San Andreas Proton prefix (as a careful,
+  supposedly read-only diagnostic -- see the incident note below for how that went)
+  -- **identical `0xbad00002` in both**, ruling out "something the fresh prefix is
+  missing that the old one had."
+- Device extensions are not the cause either: `VK_NVX_binary_import` and
+  `VK_NVX_image_view_handle` (the two upstream's own notes flag as required for the
+  Vulkan NGX route specifically) are both confirmed present and enabled (8/9 of the
+  wanted set available; only the irrelevant `VK_EXT_debug_utils` is missing).
+- Confirmed unchanged from `HANDOFF_NGX_PLATFORM_ERROR.md`'s own investigation (not
+  re-tested this session, still holds): not missing `nvngx.dll`, not the init
+  function choice, not NVAPI wiring, not an empty NGX models directory, not the
+  caller-identity spoof failing outright (`spoof::install` reports success on both
+  modules), not `DLSSNR_SKIP_NVAPI` (dead code), not a hang/deadlock.
+
+**What's still genuinely open**: since the rejection is real, reproducible, and
+prefix-independent, it's either a real limitation of Core's Vulkan-family entry
+points for this specific feature/caller (plausible: upstream's own proven, working
+route is D3D12-only; the Vulkan exports exist on the DLL but were never actually
+validated by anyone, including NVIDIA's own QA for this narrow, semi-leaked feature)
+or something about the caller-identity spoof that works against the snippet but
+isn't sufficient against Core's own, possibly different, internal caller check.
+Alex's own report is that this exact setup (this project's code, on this exact
+machine) worked before a full app removal/reinstall -- take that as real evidence
+something is recoverable, not proof it's an easy fix.
+
+**Concrete next steps, priority order** (from `HANDOFF_NGX_PLATFORM_ERROR.md`,
+still valid): recover upstream's real compiled C++ helper (was an installed system
+package before this session; check `apt-cache policy dlssnr` / `/var/cache/apt/
+archives/*.deb`) and run it side-by-side against the identical prefix/game session
+for a real reference comparison -- either it also fails (proves the issue is
+driver/environment-wide, not this project's code) or it succeeds (letting you
+`strace`/compare its actual Wine-level behavior against ours). Failing that, a real
+debugger (`winedbg`) attached at the point of the `AllocateParameters`/`Init_Ext`
+call, stepping into `nvngx.dll` itself, is the real next escalation -- last resort,
+real reverse-engineering effort, not a quick diagnostic.
+
+**Real incident this session, fixed, worth remembering**: a manual diagnostic run
+intended to be read-only pointed a different Proton build (`Proton-CachyOS Latest`)
+at the real GTA San Andreas prefix, which was actually associated with
+`GE-Proton11-6`. Proton detected the version mismatch and ran a full `wineboot -u`
+(regenerating the built-in Wine skeleton, rewriting `system.reg`/`user.reg`/
+`userdef.reg`, downloading an FSR4 upscaler file) -- non-destructive in the end
+(Wine's builtin-DLL regeneration preserves app-added registry keys), but the
+diagnostic's `timeout N` killed the outer SSH/proton command without cleanly
+stopping the `wineserver`/`winedevice.exe`/`xalia.exe` children it spawned, and that
+orphaned `wineserver` (still bound to the prefix, under the wrong Proton build) then
+blocked the game from launching normally through Steam until it was found (via
+`/proc/<pid>/environ`'s `WINEPREFIX`) and killed (`wineserver -k` with `WINEPREFIX`
+set to the exact prefix path, which for a Proton-managed prefix means the `pfx/`
+subdirectory, not the `compatdata/<appid>` directory itself -- `wineserver -k`
+silently no-ops against the wrong path with no error). **Lesson for next time**:
+before running any Proton/Wine command against a prefix you don't manage, check
+that prefix's own `version` file and use the exact same build; afterward, verify no
+process is still alive with that `WINEPREFIX` in its environment, not just that the
+outer command returned.

@@ -217,6 +217,413 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
         .build()
 }
 
+/// What [`run`] is carrying forward from the round trip it most recently *sent*,
+/// across as many present calls as the helper takes to answer it. `original` holds
+/// the exact pixels captured at send time -- needed again once the answer finally
+/// arrives, since composition combines the two -- alongside the dimensions/format
+/// that capture was taken at, so a resolution change mid-flight is detected (and the
+/// stale pair discarded) rather than composited against a mismatched frame size.
+#[derive(Default)]
+pub struct Inflight {
+    original: Vec<u8>,
+    dims: Option<(u32, u32, u32)>,
+}
+
+/// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
+/// whatever GPU work either side does) does not run at anywhere close to swapchain
+/// present rate -- measured on real hardware (`lordnikon`, 2026-09-10, see
+/// `CLAUDE.md`) at roughly 100-150ms end to end even once every other bottleneck
+/// found that same session was fixed. [`run_sync`] (this crate's entire capture path
+/// before this) called that round trip, and blocked waiting for it, from *inside*
+/// every single present call -- meaning the game's own presentation rate could never
+/// exceed the round trip's, even though the actual GPU compute involved is only a
+/// few milliseconds. That coupling, not any single slow operation, was the real
+/// cause of a reported ~2.8 fps at 4K with NR on, confirmed by removing this
+/// project's layer entirely and watching the same game return to 99% GPU utilization
+/// and a normal framerate.
+///
+/// This function decouples the two: it captures and sends a new frame only when no
+/// round trip is currently in flight, checks on any in-flight one *without blocking*
+/// (see [`ShmClient::poll_async_request`]), and applies whatever answer arrives to
+/// whichever frame happens to be current at that moment -- not necessarily the one
+/// that was captured alongside it. Every other frame (which, once the pipeline is
+/// running, is most of them) touches `image` not at all and returns `None`
+/// immediately, at effectively zero cost. The tradeoff this accepts, deliberately,
+/// per Alex's own explicit authorization ("do it if it gives us the most frames when
+/// NR is on"): the visible NR enhancement updates at whatever rate the round trip
+/// actually achieves, not every frame, and is very occasionally composited against a
+/// slightly newer frame than the one it was computed from (a few frames of temporal
+/// staleness at most, bounded by the round trip's own duration) -- a real quality
+/// tradeoff, not a free lunch, but one that keeps the game's own rendering and
+/// presentation running at its true native rate instead of being held hostage by a
+/// cross-process IPC round trip on every single frame.
+///
+/// Ordering inside a single call matters and is deliberate: capturing a new frame
+/// (when due) always happens *before* compositing an answer that arrived this same
+/// frame, because compositing overwrites `image` -- capturing after that would
+/// capture this function's own composited output instead of the game's real
+/// rendering, feeding a corrupted "original" into the next cycle.
+///
+/// # Safety
+/// Same contract as [`run_sync`]: `queue` must be the same queue `image`'s
+/// presentation was requested on, with no concurrent use of it from another thread
+/// for the duration of this call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    resources: &mut Option<CaptureResources>,
+    gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
+    shm: &mut ShmClient,
+    original_scratch: &mut Vec<u8>,
+    inflight: &mut Inflight,
+    answer_scratch: &mut Vec<u8>,
+) -> Option<vk::Semaphore> {
+    let Some(settings) = shm.composition_settings() else { return None };
+    // `debug_view`'s compare/split views and a pending `capture_request`'s dump both
+    // need *this* frame's own original and answer, not whatever the async pipeline
+    // below happens to have on hand -- same-frame correctness matters more than
+    // throughput for either, and both are rare, deliberately-triggered cases (a
+    // developer toggling a debug view, or a one-shot dump request), not the normal
+    // per-frame path this function otherwise replaces.
+    if settings.debug_view != 0 || shm.capture_request_pending() {
+        return unsafe {
+            run_sync(
+                device,
+                instance,
+                physical_device,
+                queue,
+                queue_family,
+                image,
+                width,
+                height,
+                proxy_format,
+                resources,
+                gpu_compose,
+                shm,
+                original_scratch,
+            )
+        };
+    }
+    // "Off keeps the whole pass running... and simply presents the clean frame" --
+    // `ShmHeader::apply_model`'s own doc comment -- and the model being permanently
+    // unavailable is the same "nothing will ever consume a captured frame" case
+    // `ShmClient::model_known_unavailable`'s own doc comment already covers. Either
+    // way, paying for a capture+round-trip cycle nobody will use is pure waste;
+    // skip the whole pipeline and let the caller present `image` untouched.
+    if !settings.apply_model || shm.model_known_unavailable() {
+        return None;
+    }
+
+    let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+    let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
+    if frame_bytes == 0 || frame_bytes as usize > dlssnr_protocol::MAX_FRAME {
+        return None;
+    }
+
+    // Poll whatever was sent on some earlier frame *before* touching anything else --
+    // `inflight`'s current contents correspond to it, and must be read (below) before
+    // a new capture this same frame (if one happens) is allowed to replace them.
+    let mut have_answer = false;
+    if shm.has_pending_request() {
+        if shm.poll_async_request() == Some(true) {
+            answer_scratch.resize(frame_bytes as usize, 0);
+            shm.read_answer(answer_scratch);
+            have_answer = true;
+        }
+    }
+
+    // Capture and send a new frame if (and only if) nothing is currently in flight --
+    // the wire protocol has only ever supported one outstanding request at a time.
+    // Deliberately *before* compositing below: compositing overwrites `image`, and
+    // this capture needs the game's real, unmodified rendering for this frame, not
+    // whatever this same call is about to paint over it.
+    if !shm.has_pending_request() {
+        if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
+            return None;
+        }
+        let r = resources.as_ref().expect("just ensured above");
+        if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
+            shm.set_frame_info(width, height, proxy_format);
+            shm.write_proxy(original_scratch);
+            if shm.begin_async_request() {
+                std::mem::swap(&mut inflight.original, original_scratch);
+                inflight.dims = Some((width, height, proxy_format));
+            }
+        }
+    }
+
+    if !have_answer {
+        return None;
+    }
+    // A resolution (or format) change between when `inflight` was captured and now
+    // means its bytes describe a differently-sized frame -- compositing them against
+    // `image` at today's dimensions would read/write out of step with reality.
+    // Discard rather than risk it; `inflight` gets overwritten by the next successful
+    // capture above regardless.
+    if inflight.dims != Some((width, height, proxy_format)) {
+        return None;
+    }
+    if proxy_format != dlssnr_protocol::enums::proxy_format::RGBA8 {
+        // `RGBA16F` has no composition path at all yet (see `composition::apply`'s own
+        // doc comment) -- nothing to do with a fresh answer for it here.
+        return None;
+    }
+
+    if gpu_compose.is_none() {
+        *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
+    }
+    if let Some(gpu) = gpu_compose {
+        if let Some(sem) = gpu.dispatch_into_image_async(
+            device,
+            instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            &inflight.original,
+            answer_scratch,
+            settings.colour_strength,
+            settings.transfer_strength,
+            settings.max_ratio,
+            image,
+        ) {
+            return Some(sem);
+        }
+        // Async slot busy or failed -- fall back to the same dispatch, synchronously,
+        // still cheaper and simpler than standing up a whole second (buffer-mediated,
+        // CPU-visible) write-back path for what should be a rare case.
+        if gpu.dispatch_into_image(
+            device,
+            instance,
+            physical_device,
+            queue,
+            width,
+            height,
+            &inflight.original,
+            answer_scratch,
+            settings.colour_strength,
+            settings.transfer_strength,
+            settings.max_ratio,
+            image,
+        ) {
+            return None;
+        }
+    }
+    // No GPU compose available at all (`GpuCompose::new` failed) -- last resort: the
+    // CPU reference implementation, then a plain buffer-mediated write-back using the
+    // same `CaptureResources` staging buffer `capture_pristine` above already ensured
+    // exists.
+    crate::composition::apply::apply_rgba8(
+        &inflight.original,
+        answer_scratch,
+        settings.colour_strength,
+        settings.transfer_strength,
+        settings.max_ratio,
+        0,
+    );
+    if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
+        return None;
+    }
+    let r = resources.as_ref().expect("just ensured above");
+    write_bytes_to_image(device, r, queue, image, width, height, answer_scratch);
+    None
+}
+
+/// Reads `image` (assumed `PRESENT_SRC_KHR`, exactly what any image
+/// `vkQueuePresentKHR`'s own contract hasn't already been violated on satisfies) into
+/// `out`, restoring `image` to `PRESENT_SRC_KHR` before returning -- a self-contained
+/// "read pixels, leave everything as I found it" operation, deliberately not sharing
+/// [`run_sync`]'s stage-1 barrier sequence (which ends in `TRANSFER_DST_OPTIMAL`,
+/// correct only when a stage 2 write-back on the very same image immediately
+/// follows). [`run`] calls this for a capture that will send its bytes off for
+/// evaluation and not touch `image` again until (if ever) a composited answer for a
+/// *different*, later frame arrives.
+///
+/// Fully synchronous (submits and waits) -- real, measured cost on `lordnikon`
+/// (2026-09-10) is only a few milliseconds, and it now runs once per round-trip
+/// cycle rather than once per frame, not on the hot path this exists to unblock.
+///
+/// `false` on any failure, leaving `out` unchanged and `image` in whatever layout the
+/// failure happened in -- callers already fail open on this exactly like every other
+/// stage in this module.
+#[allow(clippy::too_many_arguments)]
+fn capture_pristine(
+    device: &ash::Device,
+    r: &CaptureResources,
+    queue: vk::Queue,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    frame_bytes: u64,
+    out: &mut Vec<u8>,
+) -> bool {
+    // SAFETY: `r.cmd` was allocated from `r.pool`, created with
+    // `RESET_COMMAND_BUFFER`.
+    if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
+        return false;
+    }
+    let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: `r.cmd` was just reset above.
+    if unsafe { device.begin_command_buffer(r.cmd, &begin_info) }.is_err() {
+        return false;
+    }
+    let to_transfer_src = barrier(
+        image,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_READ,
+    );
+    // SAFETY: `r.cmd` is in the recording state; `image` is the caller's own,
+    // currently-`PRESENT_SRC_KHR` swapchain image per `vkQueuePresentKHR`'s contract.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            r.cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer_src],
+        );
+    }
+    let region = vk::BufferImageCopy::builder()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build(),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D { width, height, depth: 1 })
+        .build();
+    // SAFETY: `image` was just transitioned to `TRANSFER_SRC_OPTIMAL` above; `r.buffer`
+    // was sized to at least `frame_bytes` by `ensure`.
+    unsafe {
+        device.cmd_copy_image_to_buffer(r.cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, r.buffer, &[region]);
+    }
+    // Restore `image` to exactly the layout this function found it in -- unlike
+    // `run_sync`'s stage 1, nothing is guaranteed to touch `image` again this same
+    // frame, so leaving it in `TRANSFER_DST_OPTIMAL` (a layout only valid mid-way
+    // through an image<->buffer round trip) would be a real bug the moment the real
+    // present call ran against it instead.
+    let to_present = barrier(
+        image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+        vk::AccessFlags::TRANSFER_READ,
+        vk::AccessFlags::empty(),
+    );
+    unsafe {
+        device.cmd_pipeline_barrier(
+            r.cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_present],
+        );
+    }
+    if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
+        return false;
+    }
+    // SAFETY: `r.fence` starts signaled (see `ensure`) or was reset+waited-on by
+    // whichever of `capture_pristine`/`run_sync` last used it.
+    if unsafe { device.reset_fences(&[r.fence]) }.is_err() {
+        return false;
+    }
+    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
+    // SAFETY: `r.cmd` was just recorded and ended above.
+    if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
+        return false;
+    }
+    // SAFETY: `r.fence` was just submitted against above.
+    if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
+        return false;
+    }
+    // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (the memory
+    // type/size `ensure` just built or confirmed already satisfies this call's own
+    // `frame_bytes`).
+    let captured = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
+    out.clear();
+    out.extend_from_slice(captured);
+    true
+}
+
+/// Writes `bytes` (exactly `width*height*4` `RGBA8` bytes) into `image` via
+/// `r`'s own staging buffer -- the CPU-composited last resort when no GPU compose
+/// path is available at all. Fully synchronous; `image` assumed/left `PRESENT_SRC_KHR`
+/// exactly like [`capture_pristine`]. Best-effort: does nothing observable on failure
+/// beyond leaving `image` unpresented-to this frame, same fail-open discipline as
+/// every other stage in this module.
+fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Queue, image: vk::Image, width: u32, height: u32, bytes: &[u8]) {
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    if bytes.len() as u64 != frame_bytes {
+        return;
+    }
+    // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes -- the same
+    // invariant `capture_pristine`/`run_sync` already rely on.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.ptr, bytes.len()) };
+    // SAFETY: `r.cmd` was allocated with `RESET_COMMAND_BUFFER`.
+    if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
+        return;
+    }
+    let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    if unsafe { device.begin_command_buffer(r.cmd, &begin_info) }.is_err() {
+        return;
+    }
+    let to_dst = barrier(
+        image,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+    );
+    unsafe {
+        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+    }
+    let region = vk::BufferImageCopy::builder()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+        .image_offset(vk::Offset3D::default())
+        .image_extent(vk::Extent3D { width, height, depth: 1 })
+        .build();
+    unsafe {
+        device.cmd_copy_buffer_to_image(r.cmd, r.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+    }
+    let to_present = barrier(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+    unsafe {
+        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+    }
+    if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
+        return;
+    }
+    if unsafe { device.reset_fences(&[r.fence]) }.is_err() {
+        return;
+    }
+    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
+    if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
+        return;
+    }
+    let _ = unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) };
+}
+
 /// Captures `image` into the proxy region, runs the shared-memory round trip, and
 /// copies a result back into `image` before the caller's own present call. `resources`
 /// is the per-device slot `queue_present_khr` owns (lazily built/rebuilt here).
@@ -242,7 +649,17 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 /// external-synchronization requirement `vkQueuePresentKHR` itself already places on
 /// its own `queue` argument, which is what makes submitting here, from inside the
 /// present hook, sound without any additional locking).
-pub unsafe fn run(
+/// The old, fully-synchronous, one-frame-at-a-time path: capture *this* frame, block
+/// on the helper round trip for *this* frame's own answer (up to a real timeout
+/// budget), composite, write back -- all within the same present call. Kept
+/// unchanged and still used for the two cases that genuinely need same-frame
+/// correctness: a pending `capture_request` (its dump must show *this* frame's real
+/// before/after, not some other frame's) and any non-zero `debug_view` (the
+/// compare/split views are meaningless if original and answer come from different
+/// moments). See [`run`]'s own doc comment for why every other case no longer goes
+/// through here.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_sync(
     device: &ash::Device,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -255,6 +672,7 @@ pub unsafe fn run(
     resources: &mut Option<CaptureResources>,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
+    original_scratch: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
     let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
@@ -348,6 +766,7 @@ pub unsafe fn run(
         return None;
     }
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
+    let t_stage1_start = std::time::Instant::now();
     // SAFETY: `r.cmd` was just recorded and ended above.
     if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
         return None;
@@ -356,6 +775,7 @@ pub unsafe fn run(
     if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
         return None;
     }
+    let t_stage1 = t_stage1_start.elapsed();
 
     // CPU side: the captured bytes are now in `r.ptr` (host-coherent, no explicit
     // flush/invalidate needed). Hand them to the helper, then, if it actually
@@ -377,10 +797,19 @@ pub unsafe fn run(
     // happens -- one extra `frame_bytes`-sized allocation/copy per frame, on top of
     // the two Vulkan transfers this function already does; not yet worth avoiding
     // ahead of proving the composition path correct at all.
-    let original = captured.to_vec();
+    let t_snapshot_start = std::time::Instant::now();
+    original_scratch.clear();
+    original_scratch.extend_from_slice(captured);
+    let original: &[u8] = original_scratch.as_slice();
+    let t_snapshot = t_snapshot_start.elapsed();
+    let t_write_proxy_start = std::time::Instant::now();
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
+    let t_write_proxy = t_write_proxy_start.elapsed();
+    let t_roundtrip_start = std::time::Instant::now();
     let answered = shm.try_round_trip();
+    let t_roundtrip = t_roundtrip_start.elapsed();
+    let t_compose_start = std::time::Instant::now();
     // `Some(sem)` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
     // already wrote the fully composited result straight into `image` itself, on the
     // GPU's own timeline -- skips the capture_request dump (nothing useful to dump:
@@ -486,6 +915,15 @@ pub unsafe fn run(
         // necessarily *complete* yet, that's the entire point) and back in
         // `PRESENT_SRC_KHR`. Nothing left to do this frame except hand `sem` up to
         // the caller so the real present call waits on it.
+        crate::log!(
+            "[capture] timing stage1={:?} snapshot={:?} write_proxy={:?} roundtrip={:?} compose(async-dispatch-only)={:?} stage2=skipped total={:?}",
+            t_stage1,
+            t_snapshot,
+            t_write_proxy,
+            t_roundtrip,
+            t_compose_start.elapsed(),
+            t_stage1_start.elapsed(),
+        );
         return Some(sem);
     }
 
@@ -549,6 +987,7 @@ pub unsafe fn run(
         return None;
     }
     let submit2 = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
+    let t_stage2_start = std::time::Instant::now();
     // SAFETY: `r.cmd` was just recorded and ended above.
     if unsafe { device.queue_submit(queue, &[submit2], r.fence) }.is_err() {
         return None;
@@ -560,6 +999,21 @@ pub unsafe fn run(
     if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
         return None;
     }
+    let t_stage2 = t_stage2_start.elapsed();
+    crate::log!(
+        "[capture] timing stage1={:?} snapshot={:?} write_proxy={:?} roundtrip={:?} compose={:?} stage2={:?} total={:?}",
+        t_stage1,
+        t_snapshot,
+        t_write_proxy,
+        t_roundtrip,
+        // `t_compose_start` was captured right after the round trip; `t_stage2_start`
+        // right before stage 2's own submit -- the gap between them is exactly the
+        // composition work (CPU reference or GPU dispatch), with no double-counting
+        // against `t_stage2` below.
+        t_stage2_start.duration_since(t_compose_start),
+        t_stage2,
+        t_stage1_start.elapsed(),
+    );
 
     None
 }
@@ -571,5 +1025,214 @@ pub unsafe fn destroy(resources: Option<CaptureResources>, device: &ash::Device)
     if let Some(r) = resources {
         // SAFETY: forwarded from this function's own contract.
         unsafe { r.destroy(device) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Same shape as `composition::gpu::tests::test_device` -- a real (if software)
+    /// Vulkan device via whatever loader/ICD is on this machine, `None` if there
+    /// isn't one. Not shared with that module (private to it, and this crate has no
+    /// shared test-support module yet); small enough that duplicating it costs less
+    /// than inventing one.
+    fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
+        // SAFETY: loads the system Vulkan loader; the usual caveats of loading an
+        // arbitrary shared library apply and are accepted here the same way every
+        // other `ash` consumer in this crate already does.
+        let entry = unsafe { ash::Entry::load() }.ok()?;
+        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        // SAFETY: `create_info` is valid.
+        let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+        // SAFETY: `instance` was just created and outlives every use of `physical_device`.
+        let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
+        let queue_family = 0;
+        let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+        let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+        // SAFETY: `device_create_info` is valid; every physical device has a family 0.
+        let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
+        // SAFETY: `device`/family/index 0 match what `device_create_info` just requested.
+        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        Some((entry, instance, physical_device, device, queue, queue_family))
+    }
+
+    /// A standalone image standing in for a real swapchain image, already in
+    /// `PRESENT_SRC_KHR` -- what `run`'s own contract requires of `image` on entry,
+    /// same as any image `vkQueuePresentKHR`'s own precondition hasn't been violated
+    /// on.
+    fn make_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32) -> (vk::Image, vk::DeviceMemory) {
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None) }.expect("failed to create the test's own target image");
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = (0..mem_props.memory_type_count)
+            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .expect("no suitable memory type for the test's own target image");
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
+
+        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device.begin_command_buffer(cmd, &begin_info).unwrap();
+            let to_present = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(pool, &[cmd]);
+        }
+        (image, memory)
+    }
+
+    fn scratch_path(tag: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        format!("{}/dlssnr-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+    }
+
+    /// The real point of the pipelined redesign, exercised end to end against a real
+    /// (if software) Vulkan device: `run` must never block a present call waiting on
+    /// the helper, even when the helper genuinely takes far longer than one frame to
+    /// answer -- and once it does answer, the result must actually reach `image` via
+    /// a real, verifiable composited write (not just "a semaphore came back").
+    #[test]
+    fn run_never_blocks_on_a_slow_helper_and_eventually_composites() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("run_never_blocks_on_a_slow_helper_and_eventually_composites: no Vulkan loader/ICD, skipping");
+            return;
+        };
+
+        let path = scratch_path("blocks");
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path), "test-only open_at should always succeed against a scratch path");
+        let hdr_ptr = shm.test_header_ptr();
+        // A live helper (matters for `poll_async_request`'s timeout budget: the long
+        // "steady state" one, not the short "nobody's listening" one, since this test
+        // deliberately answers slower than that short budget).
+        unsafe { &*(hdr_ptr as *mut dlssnr_protocol::ShmHeader) }.helper_state.store(dlssnr_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+
+        // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
+        // long enough that if `run` ever blocked waiting for it, a handful of calls
+        // spaced much closer together than that would visibly take just as long.
+        const HELPER_DELAY: Duration = Duration::from_millis(250);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut dlssnr_protocol::ShmHeader) };
+            let mut last_seen = 0u32;
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    std::thread::sleep(HELPER_DELAY);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let (width, height) = (8u32, 8u32);
+        let proxy_format = dlssnr_protocol::enums::proxy_format::RGBA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let mut original_scratch = Vec::new();
+        let mut answer_scratch = Vec::new();
+        let mut inflight = Inflight::default();
+
+        let mut got_semaphore = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Real usage calls this once per present, indefinitely -- loop until either a
+        // real composited result shows up or the deadline (comfortably several
+        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count,
+        // so this can't spuriously fail just because a scratch VM's first Vulkan call
+        // of the test happened to be slow.
+        while Instant::now() < deadline {
+            let call_start = Instant::now();
+            // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; `queue`
+            // is used from this one thread only, exactly like `run`'s own contract
+            // requires of the real present hook.
+            let sem = unsafe {
+                run(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    &mut resources,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut inflight,
+                    &mut answer_scratch,
+                )
+            };
+            let call_time = call_start.elapsed();
+            assert!(
+                call_time < HELPER_DELAY / 2,
+                "a single run() call took {call_time:?} -- must never approach the helper's own {HELPER_DELAY:?} answer delay"
+            );
+            if let Some(sem) = sem {
+                got_semaphore = true;
+                // Stand in for what the real present call does: wait on the semaphore
+                // before the image is considered final, exactly like
+                // `composition::gpu::tests`' own async tests already establish.
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                unsafe {
+                    device.queue_submit(queue, &[submit], wait_fence).unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_semaphore, "the pipeline must eventually composite a real answer within 5s of real time, not just avoid blocking forever");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+
+        // SAFETY: every semaphore this test waited on has a completed, waited-for
+        // fence behind it (the explicit wait above); nothing else touched `image`.
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 }

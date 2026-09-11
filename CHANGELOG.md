@@ -1,5 +1,247 @@
 # Changelog
 
+## 0.1.24 — 2026-09-11
+
+- **Real progress on the NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) blocker documented
+  in `HANDOFF_NGX_PLATFORM_ERROR.md`**, though the underlying rejection itself is
+  still not resolved. Removed the `NVSDK_NGX_VULKAN_Init_ProjectID` call added late
+  in 0.1.23's session: upstream's own reverse-engineered notes show the only
+  *proven* ProjectID-based init route is `NVSDK_NGX_D3D12_Init_with_ProjectID`
+  against a dedicated D3D12 device — a different API family than this helper's
+  Vulkan device — and the Vulkan-exports route this helper actually used was never
+  exercised by upstream at all, just present as an export. A real bisection on
+  `lordnikon` this session tested and ruled out the leading theory that this failed
+  call was "poisoning" every later NGX call in the process: with the call removed
+  entirely, `AllocateParameters` still returns the identical `0xbad00002`.
+- **Real discovery, not a guess**: `nvngx_dlssnr.dll`'s (the "snippet") own
+  `NVSDK_NGX_VULKAN_*` exports are PE forwarders straight into `nvngx.dll` (Core) —
+  confirmed by deliberately keeping Core unloaded and observing
+  `NVSDK_NGX_VULKAN_AllocateParameters` fail to resolve via `GetProcAddress` on the
+  snippet either, with the identical wording already seen earlier in this
+  investigation when `nvngx.dll` was genuinely missing from the machine. This means
+  there was never a real "prefer snippet vs. prefer Core" choice for this call
+  family — both always run the exact same Core code. The `0xbad00002` is a real
+  rejection from Core's own NGX runtime, reproduced identically against both a
+  freshly-recreated Wine prefix and the real, untouched, previously-working
+  GTA San Andreas Proton prefix — ruling out an environment/prefix cause.
+  `crates/helper/src/ngx.rs` now documents this clearly so it isn't re-investigated
+  from scratch.
+- Fixed a real incident this session: a manual diagnostic run against the game's own
+  prefix (intended read-only) used a different Proton build than that prefix was
+  actually associated with, triggering Wine's automatic version-upgrade path and
+  leaving a stale `wineserver` holding the prefix locked, which then blocked the
+  game from launching normally through Steam. Root-caused and fixed by killing the
+  orphaned `wineserver`/`winedevice.exe`/`xalia.exe` processes still bound to that
+  prefix; the prefix's own registry rewrite that came with the version bump appears
+  otherwise harmless (Wine's builtin-DLL regeneration preserves app-added keys), and
+  the game was confirmed launching again afterward.
+- Remaining real next steps for the NGX blocker, in priority order: recover
+  upstream's real compiled C++ helper binary (still installed as a system package
+  before this session, `apt-cache policy`/`.deb` cache may still have it) and run it
+  side-by-side against the exact same prefix/game session for a real reference
+  comparison; failing that, a real debugger (`winedbg`) attached at the point of the
+  `AllocateParameters` call to see exactly which internal Core check rejects it.
+
+## 0.1.23 — 2026-09-10
+
+- **Fixed a real crash-on-start after a from-scratch reinstall** (found immediately
+  after reinstalling on `lordnikon` following the full-removal test): `start()`
+  passes `paths::prefix_dir()` to Proton as both `WINEPREFIX` and
+  `STEAM_COMPAT_DATA_PATH`, but nothing ever created that directory -- invisible on
+  every normal run (Proton creates everything *inside* it on first successful init,
+  so it's already there afterward), but fatal the moment it doesn't exist yet:
+  Proton's own `setup_prefix()` fails opening `pfx.lock` with a `FileNotFoundError`,
+  and the helper never starts. Fixed in two places for robustness: `start()` itself
+  now creates the directory directly before building the runner's environment, and
+  `paths::ensure_dirs()` (already responsible for config/data/state/binaries) now
+  includes it too.
+
+## 0.1.22 — 2026-09-10
+
+- **The real architectural fix for the low-FPS problem, not another instrumentation
+  pass.** Removing this project's layer entirely and re-testing confirmed the game
+  itself and the GPU are completely healthy (99% GPU utilization, normal framerate,
+  real clocks/power draw) -- the true cause was `capture::run` (the old function,
+  renamed `run_sync` and now used only for `debug_view`/`capture_request`) blocking
+  every single `vkQueuePresentKHR` call on a full helper round trip (real per-frame
+  cost on `lordnikon`: ~100-150ms, a cross-process, Wine-hosted IPC call that can
+  never be as fast as native in-process DLSS), capping the game's own presentation
+  rate at the round trip's rate no matter how cheap the actual GPU work involved
+  actually was.
+- Rewrote the hot path (`capture::run`) as a real pipeline: captures and sends a new
+  frame only when no round trip is already in flight
+  (`ShmClient::has_pending_request`), polls any in-flight one without ever blocking
+  (`ShmClient::begin_async_request`/`poll_async_request`, new), and applies whatever
+  answer arrives to whichever frame happens to be current at that moment via the
+  existing `dispatch_into_image_async` fast path. Every frame that isn't a capture or
+  a fresh-answer frame (the large majority, once the pipeline is running) touches
+  `image` not at all and returns immediately. Explicit, deliberate tradeoff (per
+  Alex's own prior authorization, "do it if it gives us the most frames when NR is
+  on"): NR visibly updates at whatever rate the round trip achieves, not every
+  frame, and can be composited against a slightly newer frame than the one it was
+  computed from -- a real quality cost, in exchange for the game's own rendering and
+  presentation no longer being held hostage by a cross-process round trip on every
+  single frame.
+- Fixed a real, independently-necessary Vulkan layout bug this redesign exposed:
+  `composition::gpu::GpuCompose`'s `record_copy_into_image` assumed its target image
+  was already `TRANSFER_DST_OPTIMAL`, true only because the old code always ran a
+  full capture (which left it there as a side effect) immediately before compositing
+  in the same frame. Now that captures and composites can land on different frames
+  entirely, that assumption no longer held. Fixed by having the function manage its
+  own `PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR` round trip
+  unconditionally, matching the same state any real swapchain image is already
+  guaranteed to be in.
+- New tests: `ShmClient`'s non-blocking request API (answers-in-time and
+  times-out-without-blocking cases), and a real end-to-end
+  `capture::run_never_blocks_on_a_slow_helper_and_eventually_composites` test against
+  a live (if software) Vulkan device with a deliberately slow fake helper -- asserts
+  every individual `run()` call stays fast regardless, and that a real composited
+  result still eventually lands. 33/33 layer tests pass; full workspace build and
+  test suite clean.
+
+## 0.1.21 — 2026-09-10
+
+- **Root-caused the remaining ~350ms/frame stall to the hardware level on
+  `lordnikon`.** 0.1.20's completed timing breakdown (stage1 ~5ms, snapshot ~78ms,
+  write_proxy ~68ms, roundtrip ~128ms, compose ~72ms, all summing correctly to the
+  ~355ms total) showed every full-frame-sized (33MB at 4K) operation costing a
+  similar ~70-130ms regardless of what it actually was — a heap copy, a write into a
+  shared mapping, a cross-process round trip, a GPU dispatch launch. Ruled out disk
+  I/O (`/tmp` is genuine RAM-backed `tmpfs`, `Dirty`/`Writeback` near zero, no swap
+  used), THP/compaction stalls (`enabled=madvise`, `thp_fault_alloc=0`,
+  `compact_stall` static across a 3s sample), and a remote-desktop encoding
+  bottleneck (confirmed a real physical HDMI/TV output at 3840x2160@144Hz VRR,
+  `is-current=true`, on `seat0`/`tty2` — not primarily a remote session). `perf stat`
+  on the live game process during actual play showed the real number: **97.0%
+  backend-bound, IPC 0.1** — the CPU is stalling on the memory subsystem almost the
+  entire time, a genuine low-level hardware/memory-bandwidth condition, not a logic
+  bug in this codebase. Not something a code change can fix outright.
+- **Fixed the one clear, unconditionally-correct waste found along the way**:
+  `capture::run` allocated a fresh ~31.6MiB `Vec` from scratch every single frame
+  (`captured.to_vec()`) just to snapshot the pre-edit frame for composition, instead
+  of reusing one. Added `original_scratch: Vec<u8>` to `device.rs`'s per-device
+  `State` (already `#[derive(Default)]`, already threaded through
+  `queue_present_khr` alongside `shm`/`capture`/`gpu_compose`), reused via
+  `clear()` + `extend_from_slice()` every frame. Doesn't fully explain the
+  backend-bound stall above (a `perf stat` sample at the same time showed the same
+  severe stall even accounting for this), but removes a real, unnecessary
+  allocation from the hottest path in the codebase regardless.
+
+## 0.1.20 — 2026-09-10
+
+- **Closed a ~150ms/frame gap in `capture.rs`'s own timing instrumentation.** 0.1.18's
+  stage1/roundtrip/compose/stage2 timing summed to only ~208ms on `lordnikon` against
+  a measured ~355ms total -- real data, but with an unaccounted gap exactly where two
+  full-frame-sized (33MB at 4K) operations sat untimed: `captured.to_vec()` (a fresh
+  heap allocation + copy of the whole frame, taken so composition has an unedited
+  reference after `read_answer` overwrites the original in place) and
+  `ShmClient::write_proxy` (a second full-frame copy into the shared-memory region).
+  Added `t_snapshot`/`t_write_proxy` timing around both and included them in both
+  timing log lines, so the per-frame timeline is now fully accounted for with no
+  remaining gap -- next real capture should show exactly which of these two copies
+  (if either) is the actual ~150ms cost, rather than leaving it as an inferred gap.
+
+## 0.1.19 — 2026-09-10
+
+- **Found the real, syscall-verified cause of the per-frame stall via `strace`,**
+  after 0.1.16-0.1.18's buffered-file-logging fixes made no measurable difference
+  on `lordnikon` (a separate deploy gap meant those builds were never actually
+  running in the game at all — see below). `strace -e trace=write` on the live game
+  process showed a single `crate::log!()` call in `dlssnr_layer::logging` (called
+  once, now twice with 0.1.18's added timing line, per frame from inside the game's
+  own `vkQueuePresentKHR` override) fragmenting into several separate blocking
+  `write()` syscalls against a redirected pipe — because `DLSSNR_LOG` is only ever
+  set for `dlssnr_helper.exe` (by `dlssnr_supervisor::start()`), never for the
+  game's own Steam-launched environment, so the layer's sink has always silently
+  fallen into the un-wrapped `Stderr` branch in every real deployment, completely
+  bypassing 0.1.17's `BufWriter` fix (which only wrapped `Sink::File`). Fixed by
+  wrapping `Stderr` in `BufWriter` too, in both `dlssnr_layer::logging` (the actual
+  cause here) and `dlssnr_helper::logging` (same latent gap, fixed for consistency
+  even though the helper has always had `DLSSNR_LOG` set in practice).
+- **Documented a separate, real deploy gap in `CLAUDE.md`** that silently
+  invalidated the 0.1.17 and 0.1.18 field tests on `lordnikon`: the game loads the
+  layer from a real, fixed path (`~/.local/share/dlssnr/lib/libdlssnr_layer.so`,
+  referenced by a real Vulkan implicit-layer manifest under
+  `~/.local/share/vulkan/implicit_layer.d/`) that was set up by hand earlier this
+  session and that nothing in `dlssnr-gui`/`dlssnr-cli`/`build-appimage.sh` ever
+  installs or refreshes — rebuilding and redeploying the AppImage alone does not
+  update it. Both prior "restart the game and re-measure" tests silently re-ran the
+  stale pre-fix `.so` the whole time. Flagged as an open item: this path should
+  either become self-installing/self-updating, or be replaced entirely once it's
+  understood why `VK_ADD_LAYER_PATH` (which `AppRun` does set, correctly, for
+  `dlssnr-gui`'s own process tree) can't reach a Steam-launched game process, which
+  runs as a fully separate process tree.
+
+## 0.1.18 — 2026-09-10
+
+- **Fixed the GUI's "Layer: not attached" status being wrong 100% of the time,
+  regardless of whether the layer was actually attached.** `ShmHeader::layer_attached`
+  (and every other `layer_*` telemetry field: `layer_heartbeat`, `layer_frames_lo/hi`,
+  `layer_width`/`layer_height`/`layer_format`) was declared, reset to 0 by
+  `init_defaults`, and read by `crates/gui/src/ui.rs`'s status row — but nothing
+  anywhere in `dlssnr-layer` ever wrote `1` to it (confirmed by grep). Found while
+  investigating a real report of "still low fps, also still saying layer is not
+  attached" on `lordnikon`: `/proc/<pid>/maps` and a live, steadily-advancing helper
+  frame counter both proved the real layer was loaded and actively processing frames
+  the whole time the GUI displayed "not attached" — the status readout, not the
+  pipeline, was broken. Fixed by having `ShmClient::set_frame_info` (already called
+  once per frame from `capture.rs`) write all of these fields every frame, not just
+  once at `open()` — which also matters because `open_at`'s own idempotent early
+  return means a layer that was already attached before a helper restart resets the
+  shared header never calls it again to re-set a one-shot flag.
+- **Added per-stage timing to the layer's own capture path** (`capture.rs::run`):
+  stage 1 (image→buffer GPU readback), the full helper round trip, composition
+  (CPU reference or GPU dispatch, sync or async), and stage 2 (buffer→image
+  write-back) each logged separately per frame. The 0.1.16/0.1.17 investigation
+  measured the *helper*'s own GPU work at ~3ms/frame and ruled out logging I/O as
+  the cause of the real, still-unexplained ~350ms/frame gap after buffering fixed a
+  real (separately confirmed via 93%+ iowait on one CPU core) but apparently
+  non-dominant I/O bug in both crates' loggers — this closes the one remaining
+  unmeasured segment of the pipeline: the layer's own native-side Vulkan work,
+  which nothing before this could distinguish from "the game's own render time" by
+  external observation (GPU utilization, iowait) alone.
+
+## 0.1.17 — 2026-09-10
+
+- **Found and fixed the real cause of the low-FPS reports on `lordnikon`**: the
+  0.1.16 timing instrumentation showed real GPU work costing only ~3ms/frame, yet
+  the measured frame interval was ~357ms, with the GPU sitting at 2% utilization
+  and one CPU core pegged at 92% iowait — a pure I/O stall, not a compute one. Root
+  cause: `dlssnr_helper::logging`/`dlssnr_layer::logging`'s sink wrote to a plain
+  `std::fs::File`, which has no internal buffering — every single `crate::log!` call
+  (2-3 times per frame in each crate's per-frame hot path) issued its own raw OS
+  write syscall, immediately followed by an explicit `.flush()`. On the helper side
+  specifically, that syscall runs inside a Windows-guest binary under Wine/Proton,
+  where a single such write against a real host-filesystem path measured at
+  ~150-180ms — accounting for essentially the entire missing frame time on its own.
+  This was already present in every prior release, not something 0.1.16 introduced.
+  Fixed by wrapping both sinks' file handle in `BufWriter` and flushing only every
+  64th call instead of every call, in both `crates/helper/src/logging.rs` (the
+  Wine-hosted side, the dominant cost) and `crates/layer/src/logging.rs` (the native
+  Linux side, same anti-pattern, much cheaper per-call but still a real syscall on
+  every presented frame for no reason). The layer-side fix only takes effect on the
+  next game relaunch (the `.so` is already loaded in the running game process); the
+  helper-side fix takes effect on helper restart alone.
+
+## 0.1.16 — 2026-09-10
+
+- **Diagnosing real low-FPS reports on `lordnikon`** (GTA San Andreas – The
+  Definitive Edition, real RTX 5070, upstream's conflicting package/layer fully
+  purged this session): confirmed via `/proc/<pid>/maps` that this project's own
+  `libdlssnr_layer.so` (not upstream's) is loaded directly inside the game's real
+  Vulkan process and has the SHM buffer mapped — the layer/helper wiring itself is
+  correct. The helper's own log showed real `NVSDK_NGX_Result_Success` answers every
+  call, but only ~2.8 evaluated frames/sec at 3840x2160 — each `queue_present_khr`
+  blocks on a full synchronous round trip to the helper (`shm.rs::try_round_trip`),
+  and the helper's own per-frame path (`frame.rs::evaluate`) does three sequential,
+  fence-blocking GPU round trips (CPU→GPU upload, `EvaluateFeature`, GPU→CPU
+  download) with no per-stage timing to show which one actually dominates. Added
+  `Instant`-based timing around all three stages, logged per frame
+  (`[frame] timing upload=... eval=... download=... total=...`), to get real numbers
+  instead of guessing before attempting any fix — a guess here risks "fixing" the
+  wrong stage in a closed, three-layer-translated (Windows guest → Wine → native
+  Vulkan) NGX call this project can't step through with a debugger.
+
 ## 0.1.15 — 2026-09-10
 
 - **Fixed a real, 100%-reproducible crash on every single helper start attempt**

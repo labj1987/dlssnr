@@ -277,6 +277,35 @@ pub type FnVkShutdown1 = unsafe extern "system" fn(device: vk::Device) -> NgxRes
 pub type FnVkAllocateParameters = unsafe extern "system" fn(parameters: *mut NgxParameter) -> NgxResult;
 pub type FnVkDestroyParameters = unsafe extern "system" fn(parameters: NgxParameter) -> NgxResult;
 
+/// `NVSDK_NGX_ENGINE_TYPE_CUSTOM` -- the only variant this crate ever needs (no game
+/// engine to identify as), value confirmed against NVIDIA's own public
+/// `NVIDIA/DLSS` GitHub repo (`include/nvsdk_ngx_defs.h`).
+pub const ENGINE_TYPE_CUSTOM: i32 = 0;
+
+/// `NVSDK_NGX_VULKAN_Init_ProjectID` -- the real, standard NGX Vulkan bootstrap for
+/// any non-Unreal/Unity integration (`NVSDK_NGX_ENGINE_TYPE_CUSTOM`), confirmed
+/// exported by the real `nvngx.dll` core on this machine (`strings`, 2026-09-10) and
+/// distinct from [`FnVkInitExt`]/`NVSDK_NGX_VULKAN_Init_Ext`, the signed-snippet
+/// route's own simplified (numeric `ApplicationId`, no `ProjectId`/`EngineType`)
+/// entry point this crate used exclusively before. Signature confirmed against six
+/// independent real-world callers (OptiScaler and its forks, all agreeing) rather
+/// than from this crate's own guesswork -- `PFN_vkGetInstanceProcAddr`/
+/// `PFN_vkGetDeviceProcAddr` in particular are real parameters `FnVkInitExt` omits
+/// entirely, not something to improvise the layout of.
+pub type FnVkInitProjectId = unsafe extern "system" fn(
+    project_id: *const i8,
+    engine_type: i32,
+    engine_version: *const i8,
+    app_data_path: *const u16,
+    instance: vk::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: vk::Device,
+    get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+    sdk_version: u32,
+    feature_info: *const c_void,
+) -> NgxResult;
+
 #[repr(C)]
 pub struct NgxSdkVersion {
     pub major: u32,

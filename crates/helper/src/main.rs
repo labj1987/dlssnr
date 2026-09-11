@@ -43,14 +43,18 @@ fn main() {
     hdr.control_seq.fetch_add(1, Ordering::Relaxed);
     hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
     dlssnr_helper::log!("[helper] shm attached");
+    dlssnr_helper::logging::flush();
 
     let Some((entry, instance, physical_device, device, queue)) = create_vulkan_context() else {
         dlssnr_helper::log!("[helper] failed to create a Vulkan context");
+        dlssnr_helper::logging::flush();
         hdr.helper_state.store(dlssnr_protocol::enums::helper_state::NO_VULKAN, Ordering::Relaxed);
         // SAFETY: nothing else references `shm` after this; it owns its own handles.
         unsafe { shm.close() };
         return;
     };
+    dlssnr_helper::log!("[helper] Vulkan context created, loading NGX next");
+    dlssnr_helper::logging::flush();
 
     let mut snippet = ngx::load_and_init(instance.handle(), physical_device, device.handle());
     hdr.helper_state.store(
@@ -62,6 +66,7 @@ fn main() {
         Ordering::Relaxed,
     );
     dlssnr_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
+    dlssnr_helper::logging::flush();
 
     let mut frame_resources: Option<frame::FrameResources> = None;
     // Resized (not reallocated fresh every frame) to whatever the current frame's

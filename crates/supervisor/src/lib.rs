@@ -67,6 +67,17 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
     if cfg.runner_path.is_empty() {
         return Err(StartError::NoRunnerConfigured);
     }
+    // Real, confirmed crash on `lordnikon` (2026-09-10): both Proton and plain Wine
+    // are handed this directory as their own prefix root (`WINEPREFIX` below, plus
+    // `STEAM_COMPAT_DATA_PATH` for Proton specifically) and assume it already exists
+    // -- Proton's own `setup_prefix()` fails opening `pfx.lock` inside it with a
+    // `FileNotFoundError` otherwise. Normally invisible (every run after the first
+    // successful one finds it already there), until it's missing for any reason --
+    // `ensure_dirs()` now creates it too, but `start()` doesn't get to assume
+    // whatever called that ran recently, or that this is the app's own supervisor
+    // creating it for the first time; `create_dir_all` is a no-op if it already
+    // exists, so paying for it unconditionally here costs nothing on the common path.
+    let _ = std::fs::create_dir_all(paths::prefix_dir());
 
     let mut envs = vec![
         ("WINEPREFIX".to_string(), paths::prefix_dir()),

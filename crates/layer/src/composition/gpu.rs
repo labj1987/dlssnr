@@ -389,19 +389,48 @@ impl ComposeSlot {
     }
 
     /// Records the copy from this slot's own `staging_buffer` (offset 0, just written
-    /// by `record_upload_and_compute`'s own final copy) straight into `target_image`
-    /// (assumed `TRANSFER_DST_OPTIMAL`), then restores `target_image` to
-    /// `PRESENT_SRC_KHR`. Deliberately buffer-mediated, not a raw `vkCmdCopyImage`
-    /// straight from `output` -- see [`GpuCompose::dispatch_into_image`]'s own doc
-    /// comment for why (format-mismatch color corruption risk).
+    /// by `record_upload_and_compute`'s own final copy) straight into `target_image`,
+    /// then restores `target_image` to `PRESENT_SRC_KHR`. Deliberately buffer-mediated,
+    /// not a raw `vkCmdCopyImage` straight from `output` -- see
+    /// [`GpuCompose::dispatch_into_image`]'s own doc comment for why (format-mismatch
+    /// color corruption risk).
+    ///
+    /// Manages `target_image`'s own `PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL ->
+    /// PRESENT_SRC_KHR` round trip itself (2026-09-10) -- until this, the contract was
+    /// "assumes already `TRANSFER_DST_OPTIMAL`", relying entirely on `capture::run`'s
+    /// own stage 1 having *already* transitioned it that far as a side effect of its
+    /// own unrelated readback. That coupling is exactly what made stage 1 and
+    /// composition inseparable, which is what forced every single present call through
+    /// a full, synchronous, helper-round-trip-gated capture+composite cycle in the
+    /// first place (see `capture.rs`'s own doc comment on the pipelined redesign this
+    /// enabled) -- a real Vulkan-layout bug waiting to happen the moment anything tried
+    /// to call this without stage 1 having just run.
     ///
     /// # Safety
     /// `self.cmd` must be recording, with `record_upload_and_compute` already called on
-    /// it this same recording.
+    /// it this same recording, and `target_image` must currently be `PRESENT_SRC_KHR`
+    /// (true of any image `vkQueuePresentKHR`'s own precondition hasn't been violated
+    /// on, real swapchain images included).
     unsafe fn record_copy_into_image(&self, device: &ash::Device, width: u32, height: u32, frame_bytes: u64, target_image: vk::Image) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         // SAFETY: forwarded from this function's own contract.
         unsafe {
+            let to_transfer_dst = image_barrier(
+                target_image,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer_dst],
+            );
             let buffer_barrier = vk::BufferMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1086,15 +1115,21 @@ mod tests {
         result
     }
 
-    fn transition_to_transfer_dst(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image) {
+    /// Puts a freshly-created (`UNDEFINED`) test image into `PRESENT_SRC_KHR` --
+    /// `record_copy_into_image`'s real precondition (2026-09-10) now that it manages
+    /// its own `PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR` round trip
+    /// instead of assuming the caller already left it in `TRANSFER_DST_OPTIMAL`, the
+    /// same state any real swapchain image is already in per `vkQueuePresentKHR`'s own
+    /// contract -- this stands in for that real precondition.
+    fn transition_to_present_src(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image) {
         let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
         let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
-            let to_dst = image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let to_present = image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
             device.end_command_buffer(cmd).unwrap();
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
@@ -1141,7 +1176,7 @@ mod tests {
         // `dispatch_into_image`'s own contract only requires `TRANSFER_DST_OPTIMAL`,
         // which `capture::run`'s stage 1 already guarantees for the real one.
         let target = make_target_image(&device, &mem_props, width, height);
-        transition_to_transfer_dst(&device, queue, pool, target.image);
+        transition_to_present_src(&device, queue, pool, target.image);
 
         let mut model_answer_for_direct = model_answer.clone();
         let ok = gpu.dispatch_into_image(
@@ -1198,7 +1233,7 @@ mod tests {
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
 
         let target = make_target_image(&device, &mem_props, width, height);
-        transition_to_transfer_dst(&device, queue, pool, target.image);
+        transition_to_present_src(&device, queue, pool, target.image);
 
         let sem = gpu.dispatch_into_image_async(
             &device, &instance, physical_device, queue, width, height, &original, &model_answer,
@@ -1266,7 +1301,7 @@ mod tests {
         // same real discipline `device.rs` follows, just without a real swapchain.
         for i in 0..(ASYNC_SLOTS * 3 + 1) {
             let target = make_target_image(&device, &mem_props, width, height);
-            transition_to_transfer_dst(&device, queue, pool, target.image);
+            transition_to_present_src(&device, queue, pool, target.image);
             let sem = gpu.dispatch_into_image_async(&device, &instance, physical_device, queue, width, height, &original, &model_answer, 1.0, 1.0, 2.0, target.image);
             let Some(sem) = sem else { panic!("dispatch_into_image_async returned None on iteration {i}") };
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();

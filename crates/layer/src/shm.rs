@@ -44,6 +44,14 @@ pub struct ShmClient {
     last_control_seq: u32,
     last_heartbeat: u32,
     dead: bool,
+    frames: u64,
+    /// The request number and send time of a round trip issued via
+    /// [`Self::begin_async_request`] that [`Self::poll_async_request`] hasn't yet
+    /// resolved (answered or timed out). `None` means no request is in flight --
+    /// callers use this to decide whether it's time to capture and send a new frame,
+    /// per the same one-outstanding-request-at-a-time limit the wire protocol has
+    /// always had (a single `seq_req`/`seq_resp` pair, not a queue).
+    pending: Option<(u32, Instant)>,
 }
 
 // SAFETY: `header` points at a `MAP_SHARED` mapping that stays valid for the process's
@@ -66,11 +74,30 @@ impl Default for ShmClient {
             last_control_seq: 0,
             last_heartbeat: 0,
             dead: false,
+            frames: 0,
+            pending: None,
         }
     }
 }
 
 impl ShmClient {
+    /// Cross-module test access to the raw header pointer -- `capture::tests` needs
+    /// to poke `helper_state`/`seq_resp` directly to stand in for a fake helper, the
+    /// same way this module's own tests do, but `header` is private to this module
+    /// and those tests live in a sibling one. Test-only; never called from real code.
+    #[cfg(test)]
+    pub(crate) fn test_header_ptr(&self) -> usize {
+        self.header as usize
+    }
+
+    /// Cross-module test access to [`Self::open_at`], same reasoning as
+    /// [`Self::test_header_ptr`]: `capture::tests` needs a scratch-path open, exactly
+    /// like this module's own tests already do, but the real method is private.
+    #[cfg(test)]
+    pub(crate) fn test_open_at(&mut self, path: &str) -> bool {
+        self.open_at(path)
+    }
+
     fn header(&self) -> Option<&dlssnr_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
         // `dlssnr_protocol::shm_total_bytes()` at this address and never unmaps it for
@@ -132,11 +159,35 @@ impl ShmClient {
     /// this frame, not the full `MAX_FRAME`-sized reservation. Call before
     /// [`Self::write_proxy`]/[`Self::try_round_trip`] so the helper never observes the
     /// `seq_req` bump before it can see what raster it describes.
-    pub fn set_frame_info(&self, width: u32, height: u32, proxy_format: u32) {
+    pub fn set_frame_info(&mut self, width: u32, height: u32, proxy_format: u32) {
+        self.frames += 1;
+        let frames = self.frames;
         let Some(hdr) = self.header() else { return };
         hdr.width.store(width, Ordering::Relaxed);
         hdr.height.store(height, Ordering::Relaxed);
         hdr.proxy_format.store(proxy_format, Ordering::Relaxed);
+
+        // The layer's own "I am alive and capturing" telemetry -- mirrors what
+        // `dlssnr_helper::main`'s loop already does for `hdr.helper_*`/`heartbeat`.
+        // Nothing else in this crate ever wrote these fields before this (confirmed by
+        // grep, 2026-09-10): `layer_attached` was declared, reset to 0 by
+        // `ShmHeader::init_defaults`, and read by the GUI (`ui.rs`'s "not attached"
+        // label) -- but never once set to 1 anywhere, so that label was always wrong,
+        // regardless of whether the layer was actually attached. Confirmed on
+        // `lordnikon` the same day: `/proc/<pid>/maps` and a live, advancing helper
+        // frame counter both proved the real Vulkan layer was loaded and working the
+        // whole time the GUI displayed "not attached". Setting this every frame (not
+        // just once at `open()`) also survives a helper restart resetting the shared
+        // header out from under an already-open, never-reconnecting layer -- exactly
+        // what happened here: `open_at`'s own idempotent early return means a layer
+        // that was already attached before the reset never calls it again to re-set a
+        // one-shot flag.
+        hdr.layer_attached.store(1, Ordering::Relaxed);
+        hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
+        hdr.layer_width.store(width, Ordering::Relaxed);
+        hdr.layer_height.store(height, Ordering::Relaxed);
+        hdr.layer_format.store(proxy_format, Ordering::Relaxed);
+        dlssnr_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
     }
 
     /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
@@ -377,6 +428,104 @@ impl ShmClient {
         false
     }
 
+    /// Whether a round trip started by [`Self::begin_async_request`] is still
+    /// in flight (sent, not yet resolved by [`Self::poll_async_request`]). Callers use
+    /// this to decide whether it's worth capturing and sending a new frame this present
+    /// call -- the wire protocol has only ever supported one outstanding request at a
+    /// time (a single `seq_req`/`seq_resp` pair, not a queue), so starting a second one
+    /// before the first resolves would just overwrite it.
+    pub fn has_pending_request(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Starts a round trip without waiting for it: bumps `seq_req` and records when,
+    /// exactly like the first half of [`Self::round_trip_after_open`], but returns
+    /// immediately instead of blocking. Pair with [`Self::poll_async_request`], called
+    /// once per frame thereafter, to find out when (or whether) it resolves.
+    ///
+    /// Returns `false` (and starts nothing) on a dead connection whose retry timer
+    /// hasn't elapsed, on `quit`, or if the mapping can't be opened -- the same
+    /// conditions [`Self::try_round_trip`] fails open on. Only ever call this when
+    /// [`Self::has_pending_request`] is `false`; calling it with a request already in
+    /// flight would silently abandon that one (its `seq_req` gets overwritten before
+    /// `poll_async_request` ever sees a matching `seq_resp`).
+    pub fn begin_async_request(&mut self) -> bool {
+        if !self.open() {
+            self.dead = true;
+            return false;
+        }
+        if self.dead && !self.should_retry() {
+            return false;
+        }
+        self.dead = false;
+
+        let hdr = self.header().expect("just opened above");
+        if hdr.quit.load(Ordering::Relaxed) != 0 {
+            self.dead = true;
+            return false;
+        }
+
+        let req = hdr.seq_req.load(Ordering::Relaxed) + 1;
+        std::sync::atomic::fence(Ordering::Release);
+        hdr.seq_req.store(req, Ordering::Relaxed);
+        self.pending = Some((req, Instant::now()));
+        true
+    }
+
+    /// Non-blocking: checks whether the request [`Self::begin_async_request`] started
+    /// has answered yet. `Some(true)` once, the instant `seq_resp` catches up (clears
+    /// the pending state, so [`Self::has_pending_request`] is `false` again
+    /// afterward -- the caller is free to start a new one). `Some(false)` while still
+    /// genuinely waiting, within budget. `None` once the budget is exceeded --
+    /// also clears the pending state (same timeout/dead-connection bookkeeping
+    /// [`Self::round_trip_after_open`] already does), so the caller knows to give up
+    /// on this cycle and start fresh rather than keep polling a request that will
+    /// never resolve. Returns `Some(false)` (never blocks, never panics) if called
+    /// with nothing pending.
+    pub fn poll_async_request(&mut self) -> Option<bool> {
+        let Some((req, sent_at)) = self.pending else { return Some(false) };
+        let Some(hdr) = self.header() else {
+            self.pending = None;
+            return None;
+        };
+        if hdr.seq_resp.load(Ordering::Relaxed) >= req {
+            std::sync::atomic::fence(Ordering::Acquire);
+            self.pending = None;
+            self.timeouts = 0;
+            self.ever_answered = true;
+            return Some(true);
+        }
+        if hdr.quit.load(Ordering::Relaxed) != 0 {
+            self.pending = None;
+            self.dead = true;
+            return None;
+        }
+        let helper_present = hdr.helper_state.load(Ordering::Relaxed) != helper_state::STOPPED;
+        let warming_up = !self.ever_answered;
+        let budget = if !helper_present {
+            Duration::from_millis(20)
+        } else if warming_up {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(1)
+        };
+        if sent_at.elapsed() < budget {
+            return Some(false);
+        }
+        self.pending = None;
+        self.timeouts += 1;
+        if self.timeouts >= 4 {
+            self.dead = true;
+            self.retry_after = Some(Instant::now() + Duration::from_secs(5));
+            crate::log!(
+                "[shm] no answer in {:?} x4 (helper {}); passing frames through, retrying in 5s",
+                budget,
+                if helper_present { "is present but silent" } else { "not running" }
+            );
+        }
+        None
+    }
+
     fn should_retry(&mut self) -> bool {
         let Some(hdr) = self.header() else { return false };
         let control_seq = hdr.control_seq.load(Ordering::Relaxed);
@@ -525,6 +674,72 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         echo.join().unwrap();
+    }
+
+    #[test]
+    fn async_request_resolves_without_blocking_when_something_answers() {
+        let path = scratch_path();
+        let mut client = ShmClient::default();
+        assert!(client.open_at(&path));
+        let hdr_ptr = client.header as usize;
+        // A live helper, so `poll_async_request`'s budget is the long "steady state"
+        // one rather than the short "nobody's listening" one -- doesn't matter here
+        // since the echo thread answers almost immediately either way, but matches
+        // what a real run looks like.
+        header_of(&client).helper_state.store(dlssnr_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = std::sync::Arc::clone(&stop);
+        let echo = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut ShmHeader) };
+            while !stop_clone.load(Ordering::Relaxed) {
+                let req = hdr.seq_req.load(Ordering::Relaxed);
+                if req != 0 && hdr.seq_resp.load(Ordering::Relaxed) != req {
+                    hdr.seq_resp.store(req, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        });
+
+        assert!(client.begin_async_request(), "should start a request against an already-open mapping");
+        assert!(client.has_pending_request());
+        // Real non-blocking behavior: a call arriving before the echo thread has had a
+        // chance to run must not hang waiting -- it either sees `Some(false)` (not
+        // answered yet) or, if the thread was fast enough, `Some(true)` -- either way
+        // this call itself returns immediately.
+        let mut resolved = client.poll_async_request() == Some(true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !resolved {
+            assert!(Instant::now() < deadline, "poll_async_request never resolved true");
+            resolved = client.poll_async_request() == Some(true);
+        }
+        assert!(!client.has_pending_request(), "a resolved request must clear pending state");
+        assert!(client.ever_answered);
+        assert!(!client.dead);
+
+        stop.store(true, Ordering::Relaxed);
+        echo.join().unwrap();
+    }
+
+    #[test]
+    fn async_request_with_no_helper_times_out_without_blocking_and_clears_pending() {
+        let path = scratch_path();
+        let mut client = ShmClient::default();
+        assert!(client.open_at(&path));
+        // helper_state defaults to STOPPED -- short "nobody's listening" budget (20ms),
+        // so this test still runs fast despite exercising a real timeout.
+        assert!(client.begin_async_request());
+        assert!(client.has_pending_request());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut result = client.poll_async_request();
+        while result == Some(false) {
+            assert!(Instant::now() < deadline, "poll_async_request never gave up");
+            result = client.poll_async_request();
+        }
+        assert_eq!(result, None, "an unanswered request past budget must resolve to None, not Some(true)");
+        assert!(!client.has_pending_request(), "a timed-out request must clear pending state too");
     }
 
     #[test]

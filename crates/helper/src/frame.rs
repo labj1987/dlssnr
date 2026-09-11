@@ -295,9 +295,11 @@ impl FrameResources {
         // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes
         // (this type's own construction sized it to exactly that).
         unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
+        let t_upload_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Upload) {
             return false;
         }
+        let t_upload = t_upload_start.elapsed();
 
         // Stage 2: the real NGX call, guarded the same way every other DLL call in
         // this crate already is.
@@ -315,7 +317,7 @@ impl FrameResources {
         // 2026-09-10) -- not new guesses, the first ones checked against real evidence.
         let name = |n: &str| std::ffi::CString::new(n).unwrap();
         // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
-        unsafe {
+        let t_eval = unsafe {
             let mut color = NgxResourceVk::from_image_view(color_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.Color").as_ptr(), std::ptr::from_mut(&mut color).cast());
             let mut output = NgxResourceVk::from_image_view(output_info, true);
@@ -348,6 +350,7 @@ impl FrameResources {
             let reset = u32::from(!self.reset_done.replace(true));
             abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
 
+            let t_eval_start = std::time::Instant::now();
             let (result, seh) = crate::guard::guarded(
                 || {
                     // SAFETY: `evaluate_feature` was resolved from the live snippet
@@ -360,16 +363,27 @@ impl FrameResources {
                 },
                 abi::result::FAIL_SEH,
             );
-            crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x}", result as u32, seh);
+            let t_eval = t_eval_start.elapsed();
+            crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result as u32, seh, t_eval);
             if !abi::succeeded(result) {
                 return false;
             }
-        }
+            t_eval
+        };
 
         // Stage 3: download Output -> answer_out.
+        let t_download_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Download) {
             return false;
         }
+        let t_download = t_download_start.elapsed();
+        crate::log!(
+            "[frame] timing upload={:?} eval={:?} download={:?} total={:?}",
+            t_upload,
+            t_eval,
+            t_download,
+            t_upload + t_eval + t_download
+        );
         // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes.
         unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), pixel_count * 4) };
         true

@@ -44,7 +44,17 @@ pub fn prefix_dir() -> String {
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
-    for dir in [config_dir(), data_dir(), state_dir(), binaries_dir()] {
+    // `prefix_dir()` included since 2026-09-10: a real, confirmed bug on `lordnikon`
+    // -- `start()` passes it as both `WINEPREFIX` and `STEAM_COMPAT_DATA_PATH`, but
+    // nothing ever created the directory itself first. Normally invisible (Proton
+    // creates everything *inside* it on first successful init, so it already exists
+    // on every subsequent run), until the directory is missing for any reason (a
+    // fresh install, or this parent being removed/reset by hand) -- then Proton's own
+    // `setup_prefix()` fails with a `FileNotFoundError` opening `pfx.lock`, since it
+    // assumes the directory it's locking already exists. `start()` itself also
+    // creates this directly (see its own comment) so this doesn't depend on whatever
+    // called `ensure_dirs()` last having actually run recently.
+    for dir in [config_dir(), data_dir(), state_dir(), binaries_dir(), prefix_dir()] {
         std::fs::create_dir_all(dir)?;
     }
     Ok(())
