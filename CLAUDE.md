@@ -1441,3 +1441,53 @@ needed fixing before shipping anything.
 (`ShmHeader::enabled`, `neural_enabled()`) was never actually read by the capture
 path at all -- turning it off in the GUI had no effect on anything real. Now gates
 `capture::run` the same way `apply_model` already does.
+
+## Real flicker root-cause, diagnosed and understood -- a known, deliberate tradeoff,
+## not a new bug (2026-09-11, same live session as the channel-swap fix above)
+
+With the channel-swap fix above deployed, Alex reported (still live, still playing):
+"when I toggle neural rendering off the flickering stops and the fps goes up but
+the game looks exactly the same with it on or off." Two separate real questions,
+both answered with hard evidence this session, not guessed:
+
+**What causes the flicker -- confirmed, not fixed by choice.** `capture::run`'s
+async pipeline (0.1.22) captures a new frame only when no round trip is already in
+flight; when a helper's answer *does* arrive, it composites `inflight.original`
+(whatever frame was sent, possibly several real frames ago) against `image` (this
+present call's own, freshly-rendered, possibly quite different content) -- exactly
+the documented, deliberately-authorized tradeoff from 0.1.22's own writeup ("NR
+visibly updates at whatever rate the round trip achieves... can be composited
+against a slightly newer frame than the one it was computed from"). Verified by a
+real, temporary diagnostic (added, tested, then fully reverted -- `git diff`
+confirms no leftovers): a marker-file-gated flag that forced every frame through
+`run_sync` (same-frame correctness, no `inflight` staleness) instead of the async
+path. Live, real-time result while Alex watched: flicker gone, FPS dropped to
+single digits (matching the pre-0.1.22 fully-synchronous profile). **Root cause
+confirmed. Given the choice, Alex chose to keep the async default and accept the
+flicker** rather than trade back the FPS gain -- this is a real, informed product
+decision, not an open bug. If this comes up again, the fix already exists and is
+already understood (force the synchronous path) -- it just isn't what Alex wants
+by default. Don't silently re-implement it as a default without asking again.
+
+**Why NR "looks the same" on/off -- confirmed real and working, just visually
+subtle for this content, not silently broken.** A real pixel diff between an
+original and composited capture from the same live session (sampled every 3rd
+pixel, `PIL`, not eyeballed) showed **95% of the frame changed**, mean per-pixel
+sum-of-absolute-channel-difference ~93.5/765 -- larger than the ~17/255-mean-diff
+scene documented in the "First confirmed correct visual output" section above, not
+smaller. NR is genuinely running and producing a real, structured, non-trivial
+result on real gameplay content. It's just that `upgrade_tone_map`'s actual designed
+effect -- highlight recovery + a gentle hue correction -- is a subtle global
+tonal/exposure shift for a normally-exposed indoor scene with no blown highlights,
+not a dramatic "AI-sharpened" look. A scene with real blown highlights (bright sky,
+direct sun, headlights) would very likely show a much more obvious before/after --
+untested this session, a real, cheap next step if this comes up again and a more
+convincing demo is wanted.
+
+**Still-open, separate, smaller-priority gaps, unaffected by any of the above**:
+real motion vectors (still an all-zero placeholder) and the NGX model's own
+Color/Output format (still hardcoded RGBA regardless of the real captured format,
+see the channel-swap section above) are both still real, still open. Neither was
+what caused the flicker Alex actually experienced and reported this session --
+don't reach for either as "the fix" without new evidence pointing at them
+specifically, the way the async-pipeline diagnostic above pointed at frame staleness.
