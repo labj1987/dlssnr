@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.28 — 2026-09-11
+
+- **Fixed a real bug found while investigating "GTA V Enhanced has no effect and no
+  performance cost"**: `dlssnr_supervisor::stop()`'s process-group kill could report
+  success while the actual Wine-hosted `dlssnr_helper.exe` survived anyway, once
+  wineserver took it over — Wine's own internal process management doesn't reliably
+  stay inside the original `setsid()` process group. Confirmed via a real orphaned
+  helper left running after a `stop()`/`start()` cycle on `lordnikon`: it kept
+  writing to the same live SHM mapping as the newly-started helper, silently
+  corrupting shared state (`helper_state` flapping between two independent writers,
+  with no crash or error anywhere pointing at the real cause). `stop()` now also
+  runs `wineserver -k` against the exact configured prefix afterward (best-effort,
+  same recovery this project's own manual testing has used by hand every time this
+  exact symptom came up) — closes the gap so a routine stop/restart no longer needs
+  a human to notice and clean up the orphan by hand. New `wineserver_binary` helper
+  (4 new tests) resolves the real wineserver binary next to whatever Proton build is
+  configured.
+- Fixed a real, confirmed-intermittent (not hypothetical) test race:
+  `paths::tests::finds_a_real_steam_install_under_xdg_data_home` and
+  `returns_none_when_no_candidate_exists` both mutated the process-wide
+  `XDG_DATA_HOME` env var with no synchronization — Rust's default parallel test
+  harness let them race for real (failed ~1 run in 3 under `cargo test`'s
+  workspace-wide scheduling). Added a shared lock; 5/5 clean runs confirmed after.
+
 ## 0.1.27 — 2026-09-11
 
 - **Hid the pointless console window `dlssnr_helper.exe` popped up on every real

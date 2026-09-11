@@ -1491,3 +1491,71 @@ see the channel-swap section above) are both still real, still open. Neither was
 what caused the flicker Alex actually experienced and reported this session --
 don't reach for either as "the fix" without new evidence pointing at them
 specifically, the way the async-pipeline diagnostic above pointed at frame staleness.
+
+## `dlssnr_supervisor::stop()` could leave an orphaned Wine-hosted helper running --
+## FIXED (2026-09-11), found chasing "GTA V Enhanced has no effect and no
+## performance cost" on `lordnikon`
+
+Alex tested against a second real game (GTA V Enhanced) the same session: "no
+flickering but doesn't have and[sic] effect on the look or performance." Zero
+performance impact was the real tell -- if NR were genuinely running, even the
+cheapest path costs *something*. Investigation found a real, separate,
+process-supervision bug, not anything about GTA V Enhanced itself or the NGX/
+composition pipeline covered elsewhere in this file.
+
+**What was found**: `helper_state` read back `MODEL_FAILED` from a live
+`dlssnr-cli shmctl status` even though the *current* helper process's own log
+showed nothing but real, successful `EvaluateFeature -> 0x1` calls -- a genuine
+contradiction, since `ensure_feature`'s "one-shot" design (see its own doc comment)
+makes it structurally impossible for a helper that already has a working feature to
+ever reach the `MODEL_FAILED`-setting code path again. The real explanation: a
+**second, orphaned `dlssnr_helper.exe` process from earlier manual testing this
+same session was still alive**, writing to the exact same `/tmp/dlssnr-1000/shm.bin`
+mapping as the properly-started one -- two independent writers racing on one shared
+header. Confirmed directly: `ps`/`/proc/<pid>/environ` showed a stray
+`dlssnr_helper.exe` (started hours earlier for the NGX/BGR investigations above,
+never cleanly killed) still bound to the same `DLSSNR_SHM` path.
+
+**Root cause, confirmed by direct reproduction, not inferred**: `dlssnr-cli stop`
+(→ `dlssnr_supervisor::process::stop`) sends `SIGTERM`/`SIGKILL` to the process
+*group* the original `setsid()`'d launcher led, then declares success once that
+one process-group-leader PID is dead -- it never checks whether the real,
+Wine-hosted grandchild (the actual `dlssnr_helper.exe`, once wineserver takes it
+over) is *also* gone. Reproduced live: after a `dlssnr-cli stop` that printed
+"helper stopped" followed by `dlssnr-cli start`, the *old* Wine-hosted `.exe` was
+still running (confirmed via `ps`) alongside the brand-new one. This is the same
+class of problem `crates/supervisor/src/process.rs`'s own `#[ignore]`d test
+(`stop_kills_the_whole_process_group_not_just_the_leader`) flagged as a *dev
+sandbox limitation* -- but this reproduction happened on `lordnikon`, the real
+target machine, not the sandbox. Wine/Proton's own process management genuinely
+doesn't reliably keep every descendant inside the original process group; this
+isn't purely a sandboxed-signal-delivery artifact.
+
+**The fix** (`crates/supervisor/src/lib.rs`): `stop()` now also runs
+`wineserver -k` against the exact configured `WINEPREFIX`
+(`paths::prefix_dir()`) after the normal process-group kill -- the identical
+manual recovery command this project's own real-hardware testing has used by hand
+every single time this exact symptom came up (see the "Real incident this
+session" notes elsewhere in this file). New `wineserver_binary(cfg)` resolves the
+real wineserver binary next to whatever Proton build is configured
+(`<runner dir>/files/bin/wineserver`, confirmed present at that exact relative
+path on real installs) or falls back to `PATH` for a plain-Wine runner. Best-effort
+(ignores errors) -- a plain Wine install with no `wineserver` on `PATH`, or nothing
+left to kill, are not real failures worth surfacing.
+
+**Verified**: 4 new tests for `wineserver_binary`'s own resolution logic (proton
+with a real sibling, proton with none, plain wine falling back to `PATH`, no
+runner configured at all) plus manual cleanup + a clean restart on `lordnikon`
+confirmed `helper_state` reads back `RUNNING` again with exactly one helper
+process alive. A second, unrelated but real bug was found and fixed the same
+pass: `paths::tests::finds_a_real_steam_install_under_xdg_data_home` and
+`returns_none_when_no_candidate_exists` raced on the same process-wide
+`XDG_DATA_HOME` env var (confirmed genuinely intermittent under `cargo test`'s
+workspace-wide scheduling, not hypothetical) -- fixed with a shared lock.
+
+**Not yet re-tested against GTA V Enhanced itself** after this fix and the
+cleanup -- the immediate cause of "no effect" this session was the corrupted
+shared state from the orphaned process, not necessarily anything specific to that
+game, but that's inference, not confirmation. If it still shows no effect after a
+clean helper restart, treat that as a fresh, unconfirmed report, not a re-run of
+this same bug.

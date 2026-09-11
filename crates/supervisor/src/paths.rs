@@ -85,6 +85,18 @@ pub fn steam_install_dir() -> Option<String> {
 mod tests {
     use super::*;
 
+    // Guards every test below that mutates `XDG_DATA_HOME` (a real, process-wide
+    // environment variable, not something scoped per-test) -- Rust's default test
+    // harness runs tests in parallel threads within the same process, so two such
+    // tests running concurrently can and did race for real: one test's `assert_eq!`
+    // observing the *other* test's own `XDG_DATA_HOME` value mid-flight. Confirmed
+    // genuinely intermittent, not a one-off: `cargo test` (workspace-wide, different
+    // thread scheduling than running this crate alone) failed roughly 1 run in 3
+    // before this lock existed, 2026-09-11. Every test touching this env var must
+    // acquire this lock for its entire duration, restoring the prior value (or
+    // removing it) before releasing.
+    static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Real filesystem, real env var override -- confirms `steam_install_dir` actually
     /// finds a directory that exists (not just "returns some string unconditionally"),
     /// and returns `None` when nothing does. Found and fixed as a real bug 2026-09-10:
@@ -93,6 +105,7 @@ mod tests {
     /// start attempt with `runner_type = "proton"`.
     #[test]
     fn finds_a_real_steam_install_under_xdg_data_home() {
+        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-{}", std::process::id()));
         let steam_dir = scratch.join("Steam");
         std::fs::create_dir_all(&steam_dir).unwrap();
@@ -112,6 +125,7 @@ mod tests {
 
     #[test]
     fn returns_none_when_no_candidate_exists() {
+        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-none-{}", std::process::id()));
         // Deliberately do not create `scratch` itself -- every candidate under it is
         // real-but-nonexistent, the case this function must fail open on.

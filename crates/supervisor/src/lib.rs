@@ -23,8 +23,45 @@ pub fn is_running() -> Option<i32> {
 }
 
 /// Graceful-then-forced stop of the whole helper process group.
+///
+/// Real, confirmed bug on `lordnikon` (2026-09-11): `process::stop`'s process-group
+/// kill can report success while the actual Wine-hosted `dlssnr_helper.exe` survives
+/// anyway, once wineserver has taken it over -- Wine's own internal process
+/// management doesn't reliably keep every process inside the group the original
+/// `setsid()` created. Confirmed via a real, orphaned helper left running after a
+/// `stop()`/`start()` cycle: it kept writing to the same live SHM mapping as the new
+/// helper, corrupting shared state (`helper_state` flapping between two independent
+/// writers) with no crash or error anywhere to point at the real cause. A real
+/// `wineserver -k` against this exact prefix -- the same recovery this project's own
+/// manual testing has used by hand every time this exact symptom came up -- is
+/// cheap, targeted, and closes the gap: best-effort (a plain Wine install with no
+/// `wineserver` on `PATH`, or nothing left to kill, are not real failures worth
+/// surfacing), run after the normal group kill so a routine stop/restart no longer
+/// needs a human to notice and clean this up by hand.
 pub fn stop(timeout: Duration) -> std::io::Result<()> {
-    process::stop(&pid_file(), timeout)
+    process::stop(&pid_file(), timeout)?;
+    let cfg = Config::load();
+    if let Some(wineserver) = wineserver_binary(&cfg) {
+        let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", paths::prefix_dir()).status();
+    }
+    Ok(())
+}
+
+/// The `wineserver` binary belonging to `cfg`'s configured runner -- for Proton, a
+/// sibling of the `proton` script itself (`<runner dir>/files/bin/wineserver`,
+/// confirmed present at that exact relative path on real Proton-CachyOS/GE
+/// installs); for plain Wine, `wineserver` is normally already resolvable via
+/// `PATH` alongside `wine` itself, so no path derivation is needed.
+fn wineserver_binary(cfg: &Config) -> Option<String> {
+    if cfg.runner_type == "proton" {
+        let dir = std::path::Path::new(&cfg.runner_path).parent()?;
+        let candidate = dir.join("files/bin/wineserver");
+        candidate.is_file().then(|| candidate.display().to_string())
+    } else if cfg.runner_type.is_empty() {
+        None
+    } else {
+        Some("wineserver".to_string())
+    }
 }
 
 #[derive(Debug)]
@@ -122,4 +159,41 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
             log: cfg.log.clone(),
         })
         .map_err(StartError::Spawn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wineserver_binary_finds_a_real_sibling_next_to_a_proton_runner() {
+        let dir = std::env::temp_dir().join(format!("dlssnr-wineserver-test-{}", std::process::id()));
+        let wineserver_dir = dir.join("files/bin");
+        std::fs::create_dir_all(&wineserver_dir).unwrap();
+        let wineserver_path = wineserver_dir.join("wineserver");
+        std::fs::write(&wineserver_path, "").unwrap();
+
+        let cfg = Config { runner_type: "proton".to_string(), runner_path: dir.join("proton").display().to_string(), ..Config::default() };
+        assert_eq!(wineserver_binary(&cfg), Some(wineserver_path.display().to_string()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wineserver_binary_is_none_for_proton_with_no_real_sibling() {
+        // A path that doesn't exist at all -- no `files/bin/wineserver` to find.
+        let cfg = Config { runner_type: "proton".to_string(), runner_path: "/nonexistent/proton".to_string(), ..Config::default() };
+        assert_eq!(wineserver_binary(&cfg), None);
+    }
+
+    #[test]
+    fn wineserver_binary_falls_back_to_path_for_plain_wine() {
+        let cfg = Config { runner_type: "wine".to_string(), runner_path: "/usr/bin/wine".to_string(), ..Config::default() };
+        assert_eq!(wineserver_binary(&cfg), Some("wineserver".to_string()));
+    }
+
+    #[test]
+    fn wineserver_binary_is_none_with_no_runner_configured() {
+        assert_eq!(wineserver_binary(&Config::default()), None);
+    }
 }
