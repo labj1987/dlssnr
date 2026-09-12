@@ -292,6 +292,7 @@ impl FrameResources {
         motion: &[u8],
         motion_scale: [f32; 2],
         reset_history: bool,
+        tuning: dlssnr_protocol::PassTuning,
         answer_out: &mut [u8],
     ) -> bool {
         let pixel_count = (self.width as usize) * (self.height as usize);
@@ -337,6 +338,16 @@ impl FrameResources {
             abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
             abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
             abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
+            // Apply the controls the GUI publishes for every model evaluation. These
+            // values were previously fixed at feature creation, so changing a control
+            // in the app had no effect on the live renderer.
+            abi::ngx_set_u32(params, name("DLSSNR.Style").as_ptr(), tuning.style);
+            abi::ngx_set_f32(params, name("DLSSNR.Intensity").as_ptr(), tuning.intensity.clamp(0.0, 2.0));
+            abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), tuning.local_tone.clamp(0.0, 2.0));
+            abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), tuning.local_structure.clamp(0.0, 2.0));
+            abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), tuning.skin_structure.clamp(-1.0, 2.0));
+            abi::ngx_set_f32(params, name("DLSSNR.Sharpness").as_ptr(), tuning.sharpness.clamp(0.0, 2.0));
+            abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), tuning.auto_mask.min(1));
             let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
             let mut depth = NgxResourceVk::from_image_view(depth_info, false);

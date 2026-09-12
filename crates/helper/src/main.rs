@@ -134,7 +134,8 @@ fn main() {
                     }
                     let f = frame_resources.as_ref()?;
                     let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, &proxy_buf[..n], &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), &mut answer_buf[..n]).then_some(())
+                    let tuning = hdr.resolve_pass(0);
+                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, &proxy_buf[..n], &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, &mut answer_buf[..n]).then_some(())
                 })()
                 .is_some();
             if !evaluated {
