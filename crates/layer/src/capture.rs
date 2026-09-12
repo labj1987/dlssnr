@@ -868,7 +868,13 @@ unsafe fn run_sync(
                     // available, or fails, same fail-open discipline as every other
                     // stage in this function.
                     let mut composed_sync = false;
-                    if settings.debug_view == 0 {
+                    // The helper's model output is the intended display-referred
+                    // neural result. The legacy tone-map compositor was built for
+                    // a clipped, downscaled proxy, but this pipeline feeds it the
+                    // full original frame; it therefore collapses most of the model
+                    // edit back toward the source image. Present the raw model result
+                    // for normal rendering until that proxy pipeline exists.
+                    if false && settings.debug_view == 0 {
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
@@ -928,7 +934,7 @@ unsafe fn run_sync(
                             settings.colour_strength,
                             settings.transfer_strength,
                             settings.max_ratio,
-                            settings.debug_view,
+                            if settings.debug_view == 0 { 2 } else { settings.debug_view },
                             bgr_order,
                         );
                     }
@@ -948,7 +954,8 @@ unsafe fn run_sync(
         if let Some(settings) = shm.composition_settings() {
             if settings.apply_model && settings.neural_enabled && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
                 crate::composition::apply::apply_rgba8(&original, answer_dst, settings.colour_strength,
-                    settings.transfer_strength, settings.max_ratio, settings.debug_view, bgr_order);
+                    settings.transfer_strength, settings.max_ratio,
+                    if settings.debug_view == 0 { 2 } else { settings.debug_view }, bgr_order);
             }
         }
     }
