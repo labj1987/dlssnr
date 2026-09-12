@@ -3,22 +3,18 @@
 //! (motion vectors), and Depth -- and the upload/evaluate/download sequence that binds
 //! them.
 //!
-//! MVec scope: no real optical flow yet (`VK_NV_optical_flow`, mentioned in the
-//! README, isn't wired up anywhere in this crate) -- this always hands the model an
-//! all-zero MVec image, i.e. "no motion", a safe default rather than nothing at all.
-//! Wiring up real synthetic motion vectors is separate follow-up work, not required
-//! for the create/evaluate/read-back plumbing this module proves.
+//! Motion comes from the native layer's optical-flow stage via shared memory.
+//! A missing/reset history produces zero vectors; valid history is R16G16_SFLOAT.
 //!
 //! Depth scope, added 2026-09-10: `DLSSNR.Depth`/`DLSSNR.DepthInverted` are real,
 //! confirmed-present parameters (`strings` against the real `nvngx_dlssnr.dll` turns up
 //! `DLSSNR: EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p ...`, naming exactly
 //! four resources) this crate never bound before -- a real, plausible cause of a first
 //! real visual check (see `CLAUDE.md`) turning up a solid-white `EvaluateFeature`
-//! answer despite a `0x1` success code. Like MVec, there is no real depth buffer to
+//! answer despite a `0x1` success code. There is no real depth buffer to
 //! give it yet (`dlssnr_layer::capture` only ever captures the presented color image),
 //! so this hands the model a constant, synthetic "far plane, no real depth" value --
-//! an honest stand-in, not a real per-pixel depth buffer, same spirit as MVec's
-//! all-zero placeholder.
+//! an honest stand-in, not a real per-pixel depth buffer.
 //!
 //! Same staging-copy discipline as `dlssnr_layer::capture`: images are populated via
 //! an explicit host-visible-buffer upload/download, not a zero-copy import.
@@ -28,6 +24,7 @@ use ash::vk;
 use crate::abi::{self, NgxImageViewInfoVk, NgxResourceVk};
 
 pub struct FrameResources {
+    color_format: vk::Format,
     width: u32,
     height: u32,
     queue_family: u32,
@@ -69,7 +66,14 @@ pub struct FrameResources {
 // in `main.rs` that owns this value.
 unsafe impl Send for FrameResources {}
 
-const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+fn color_format(proxy: u32) -> Option<vk::Format> {
+    use dlssnr_protocol::enums::proxy_format;
+    match proxy {
+        proxy_format::RGBA8 => Some(vk::Format::R8G8B8A8_UNORM),
+        proxy_format::BGRA8 => Some(vk::Format::B8G8R8A8_UNORM),
+        _ => None,
+    }
+}
 const MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 // `DLSSNR.Depth`/`DLSSNR.DepthInverted` exist in the real DLL's own string table
 // (`EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p` -- confirmed present via
@@ -166,7 +170,9 @@ impl FrameResources {
         queue_family: u32,
         width: u32,
         height: u32,
+        proxy_format: u32,
     ) -> Option<Self> {
+        let color_format = color_format(proxy_format)?;
         // SAFETY: `physical_device` is the device everything below is built against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
@@ -175,7 +181,7 @@ impl FrameResources {
             &mem_props,
             width,
             height,
-            COLOR_FORMAT,
+            color_format,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
         )?;
         let (output_image, output_view, output_memory) = create_image(
@@ -183,7 +189,7 @@ impl FrameResources {
             &mem_props,
             width,
             height,
-            COLOR_FORMAT,
+            color_format,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
         )?;
         let (mvec_image, mvec_view, mvec_memory) = create_image(
@@ -215,10 +221,8 @@ impl FrameResources {
         // SAFETY: `fence_info` is valid.
         let fence = unsafe { device.create_fence(&fence_info, None) }.ok()?;
 
-        // Sized for the largest single-plane 8-bit transfer this ever does (Color or
-        // Output, both 4 bytes/pixel); MVec (2 bytes/pixel) always fits the same
-        // allocation.
-        let staging_size = u64::from(width) * u64::from(height) * 4;
+        // Upload holds Color plus R16G16_SFLOAT motion (4 bytes/pixel each).
+        let staging_size = u64::from(width) * u64::from(height) * 8;
         let buf_info = vk::BufferCreateInfo::builder()
             .size(staging_size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -243,6 +247,7 @@ impl FrameResources {
         let staging_ptr = unsafe { device.map_memory(staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.ok()?.cast::<u8>();
 
         Some(Self {
+            color_format,
             width,
             height,
             queue_family,
@@ -268,11 +273,11 @@ impl FrameResources {
         })
     }
 
-    pub fn matches(&self, queue_family: u32, width: u32, height: u32) -> bool {
-        self.queue_family == queue_family && self.width == width && self.height == height
+    pub fn matches(&self, queue_family: u32, width: u32, height: u32, proxy_format: u32) -> bool {
+        Some(self.color_format) == color_format(proxy_format) && self.queue_family == queue_family && self.width == width && self.height == height
     }
 
-    /// Uploads `proxy` into Color, zeroes MVec, runs `EvaluateFeature`, downloads
+    /// Uploads `proxy` and motion, runs `EvaluateFeature`, downloads
     /// Output into `answer_out`. Returns `false` (leaving `answer_out` untouched) on
     /// any failure, including a guarded fault inside `EvaluateFeature` itself.
     #[allow(clippy::too_many_arguments)]
@@ -284,6 +289,9 @@ impl FrameResources {
         feature: abi::NgxHandle,
         params: abi::NgxParameter,
         proxy: &[u8],
+        motion: &[u8],
+        motion_scale: [f32; 2],
+        reset_history: bool,
         answer_out: &mut [u8],
     ) -> bool {
         let pixel_count = (self.width as usize) * (self.height as usize);
@@ -291,10 +299,15 @@ impl FrameResources {
             return false;
         }
 
-        // Stage 1: upload proxy -> Color, zero -> MVec.
+        // Stage 1: upload proxy -> Color and motion -> MVec.
         // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes
         // (this type's own construction sized it to exactly that).
         unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
+        unsafe {
+            let dst = self.staging_ptr.add(pixel_count * 4);
+            if motion.len() == pixel_count * 4 { std::ptr::copy_nonoverlapping(motion.as_ptr(),dst,motion.len()); }
+            else { std::ptr::write_bytes(dst,0,pixel_count*4); }
+        }
         let t_upload_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Upload) {
             return false;
@@ -303,8 +316,8 @@ impl FrameResources {
 
         // Stage 2: the real NGX call, guarded the same way every other DLL call in
         // this crate already is.
-        let color_info = self.resource_info(self.color_view, self.color_image, COLOR_FORMAT);
-        let output_info = self.resource_info(self.output_view, self.output_image, COLOR_FORMAT);
+        let color_info = self.resource_info(self.color_view, self.color_image, self.color_format);
+        let output_info = self.resource_info(self.output_view, self.output_image, self.color_format);
         let mvec_info = self.resource_info(self.mvec_view, self.mvec_image, MVEC_FORMAT);
         let depth_info = self.resource_info(self.depth_view, self.depth_image, DEPTH_FORMAT);
         // Parameter names guessed "for shape" from the same `DLSSNR.*` convention
@@ -322,6 +335,8 @@ impl FrameResources {
             abi::ngx_set_ptr(params, name("DLSSNR.Color").as_ptr(), std::ptr::from_mut(&mut color).cast());
             let mut output = NgxResourceVk::from_image_view(output_info, true);
             abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
+            abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
+            abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
             let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
             let mut depth = NgxResourceVk::from_image_view(depth_info, false);
@@ -347,7 +362,7 @@ impl FrameResources {
             // history-dependent answer would only ever appear from the second frame
             // set to `Reset = 0` onward, which never happened before this. `1` only on
             // this feature's actual first `evaluate` call, `0` on every one after.
-            let reset = u32::from(!self.reset_done.replace(true));
+            let reset = u32::from(!self.reset_done.replace(true) || reset_history);
             abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
 
             let t_eval_start = std::time::Instant::now();
@@ -491,15 +506,10 @@ impl FrameResources {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[region(self.width, self.height)],
                     );
-                    // MVec: no real motion vectors yet (see module doc comment) --
-                    // clear to zero ("no motion") rather than leave it undefined.
-                    device.cmd_clear_color_image(
-                        self.cmd,
-                        self.mvec_image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &vk::ClearColorValue { float32: [0.0; 4] },
-                        &[sub(vk::ImageAspectFlags::COLOR)],
-                    );
+                    let mut motion_region = region(self.width,self.height);
+                    motion_region.buffer_offset = u64::from(self.width)*u64::from(self.height)*4;
+                    device.cmd_copy_buffer_to_image(self.cmd,self.staging_buffer,self.mvec_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[motion_region]);
                     // Depth: no real depth buffer captured yet either (see module doc
                     // comment) -- a constant 1.0 ("far plane", standard non-reversed-Z
                     // convention, matching `DLSSNR.DepthInverted = 0` below) rather
@@ -628,4 +638,33 @@ impl FrameResources {
 enum TransferKind {
     Upload,
     Download,
+}
+
+#[cfg(test)] mod format_tests {
+    use super::*;
+    use dlssnr_protocol::enums::proxy_format;
+    #[test]
+    #[ignore = "requires Vulkan under Wine on real hardware"]
+    fn rgba_and_bgra_resources_recreate_on_format_change() {
+        let entry = unsafe {ash::Entry::load()}.unwrap();
+        let app = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+        let instance = unsafe {entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app),None)}.unwrap();
+        let pd = unsafe {instance.enumerate_physical_devices()}.unwrap()[0];
+        let q = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
+        let device = unsafe {instance.create_device(pd,&vk::DeviceCreateInfo::builder().queue_create_infos(&q),None)}.unwrap();
+        for format in [proxy_format::RGBA8,proxy_format::BGRA8] {
+            let f = FrameResources::new(&device,&instance,pd,0,512,512,format).expect("real Color/Output/MVec resources");
+            assert!(f.matches(0,512,512,format));
+            assert!(!f.matches(0,512,512,if format == proxy_format::RGBA8 {proxy_format::BGRA8} else {proxy_format::RGBA8}));
+            assert!(!f.matches(0,256,512,format));
+            unsafe {f.destroy(&device)};
+        }
+        unsafe {device.destroy_device(None);instance.destroy_instance(None)};
+    }
+    #[test] fn ngx_formats_match_raw_bytes() {
+        assert_eq!(color_format(proxy_format::RGBA8),Some(vk::Format::R8G8B8A8_UNORM));
+        assert_eq!(color_format(proxy_format::BGRA8),Some(vk::Format::B8G8R8A8_UNORM));
+        assert_eq!(color_format(proxy_format::RGBA16F),None);
+        assert_eq!(color_format(999),None);
+    }
 }

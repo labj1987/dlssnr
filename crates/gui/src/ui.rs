@@ -40,6 +40,76 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     row
 }
 
+/// GDK on Linux X11/Wayland uses XKB hardware codes (evdev + 8).
+fn evdev_keycode(hardware: u32) -> Option<u32> {
+    hardware.checked_sub(8).filter(|&code| code > 0 && code <= 767)
+}
+
+fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Toggle key")
+        .subtitle("Save a single key binding; in-game hotkey polling is not available yet") .build();
+    let label = |code| if code == 0 { "Unbound".to_owned() } else { format!("Key {code}") };
+    let button = gtk4::Button::with_label(&label(initial));
+    button.set_valign(gtk4::Align::Center);
+    let clear = gtk4::Button::with_label("Clear");
+    clear.set_valign(gtk4::Align::Center);
+    let value = std::rc::Rc::new(std::cell::Cell::new(initial));
+    let capturing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let setter = std::rc::Rc::new(setter);
+    let controller = gtk4::EventControllerKey::new();
+    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let capturing = capturing.clone();
+        button.connect_clicked(move |button| {
+            capturing.set(true);
+            button.set_label("Press a key (Esc cancels)");
+            button.grab_focus();
+        });
+    }
+    {
+        let button = button.downgrade();
+        let capturing = capturing.clone();
+        let value = value.clone();
+        let setter = setter.clone();
+        controller.connect_key_pressed(move |_, key, hardware, _| {
+            if !capturing.get() { return glib::Propagation::Proceed; }
+            if let Some(button) = button.upgrade() {
+                if key != gtk4::gdk::Key::Escape {
+                    if let Some(code) = evdev_keycode(hardware) {
+                        setter(code);
+                        value.set(code);
+                    }
+                }
+                capturing.set(false);
+                button.set_label(&label(value.get()));
+            }
+            glib::Propagation::Stop
+        });
+    }
+    {
+        let capturing = capturing.clone();
+        let value = value.clone();
+        button.connect_has_focus_notify(move |button| {
+            if !button.has_focus() && capturing.replace(false) {
+                button.set_label(&label(value.get()));
+            }
+        });
+    }
+    {
+        let button = button.clone();
+        clear.connect_clicked(move |_| {
+            capturing.set(false);
+            value.set(0);
+            setter(0);
+            button.set_label("Unbound");
+        });
+    }
+    button.add_controller(controller);
+    row.add_suffix(&button);
+    row.add_suffix(&clear);
+    row
+}
+
 pub fn build_ui(app: &adw::Application) {
     let Some(shm) = Shm::open() else {
         build_error_window(app);
@@ -82,6 +152,9 @@ pub fn build_ui(app: &adw::Application) {
 
     let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
     model_group.add(&spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32)));
+
+    let (toggle_key, set_toggle_key) = bind_u32(&shm, Some("toggle_key"), |h| &h.toggle_key);
+    model_group.add(&hotkey_row(toggle_key, set_toggle_key));
 
     // --- Motion --------------------------------------------------------------------
     let motion_group = adw::PreferencesGroup::new();
@@ -142,6 +215,18 @@ pub fn build_ui(app: &adw::Application) {
     comp_group.add(&combo_row("Colour mode", &["Auto", "Force display-referred", "Force linear HDR"], colour_mode, set_colour_mode));
     debug_assert_eq!(colour_mode::AUTO, 0);
 
+    let hdr_group = adw::PreferencesGroup::new();
+    hdr_group.set_title("HDR white point");
+    hdr_group.set_description(Some("Saved for HDR processing. The current capture pipeline does not yet apply these controls."));
+    let (source, set_source) = bind_u32(&shm, Some("white_point_source"), |h| &h.white_point_source);
+    hdr_group.add(&combo_row("White point source", &["Manual", "Measured"], source, set_source));
+    let (white, set_white) = bind_float(&shm, Some("white_point"), |h| &h.white_point_bits);
+    hdr_group.add(&spin_row("Manual white point", "Linear-light reference", white, 0.01, 10000.0, 0.1, set_white));
+    let (scale, set_scale) = bind_float(&shm, Some("white_point_scale"), |h| &h.white_point_scale_bits);
+    hdr_group.add(&spin_row("White point scale", "Multiplier", scale, 0.01, 100.0, 0.05, set_scale));
+    let (trim, set_trim) = bind_float(&shm, Some("white_point_trim"), |h| &h.white_point_trim_bits);
+    hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, 0.01, 100.0, 0.05, set_trim));
+
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
     comp_group.add(&combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer));
 
@@ -186,6 +271,7 @@ pub fn build_ui(app: &adw::Application) {
     page.add(&model_group);
     page.add(&motion_group);
     page.add(&comp_group);
+    page.add(&hdr_group);
     page.add(&debug_group);
     page.add(&build_status_group(&shm, &toasts));
 
@@ -348,4 +434,15 @@ fn build_error_window(app: &adw::Application) {
         .build();
     let window = adw::ApplicationWindow::builder().application(app).title("dlssnr").content(&status).build();
     window.present();
+}
+
+#[cfg(test)] mod hotkey_tests {
+    use super::*;
+    #[test] fn hardware_codes_are_converted_without_underflow() {
+        assert_eq!(evdev_keycode(95),Some(87)); // F11: XKB -> Linux evdev.
+        assert_eq!(evdev_keycode(38),Some(30)); // physical A key on evdev.
+        assert_eq!(evdev_keycode(0),None);
+        assert_eq!(evdev_keycode(8),None);
+        assert_eq!(evdev_keycode(u32::MAX),None);
+    }
 }

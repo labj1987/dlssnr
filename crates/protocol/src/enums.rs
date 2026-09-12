@@ -119,6 +119,11 @@ pub mod proxy_format {
     pub const UNKNOWN: u32 = 0;
     pub const RGBA8: u32 = 1;
     pub const RGBA16F: u32 = 2;
+    pub const BGRA8: u32 = 3;
+
+    pub fn is_8bit(format: u32) -> bool {
+        matches!(format, RGBA8 | BGRA8)
+    }
 
     /// Bytes per pixel for a raw dump in this format -- shared by the layer (which
     /// writes the proxy region at this size) and the helper (which needs to know how

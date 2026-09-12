@@ -33,6 +33,7 @@ mod header;
 pub mod mapping;
 mod path;
 pub mod persist;
+pub mod motion;
 
 pub use header::{load64, store64, PassControl, PassTuning, ShmHeader};
 pub use path::{shm_default_path, shm_runtime_dir};
@@ -42,10 +43,11 @@ pub use path::{shm_default_path, shm_runtime_dir};
 /// version of our mapping" — that distinction is `SHM_VERSION`'s job.
 pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"DSN1");
 
+/// The wire contract version (v2 adds BGRA8 and a motion payload region).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; callers should log loudly and
 /// reinitialize rather than half-read a header laid out differently than they expect.
-pub const SHM_VERSION: u32 = 1;
+pub const SHM_VERSION: u32 = 2;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;
@@ -65,9 +67,9 @@ pub const DEFAULT_MAX_PASSES: u32 = 5;
 pub const REASON_BYTES: usize = 192;
 pub const NAME_BYTES: usize = 128;
 
-/// Total size of the mapping: the header plus both pixel regions.
+/// Total size of the mapping: header, proxy, answer, and motion regions.
 pub const fn shm_total_bytes() -> usize {
-    HEADER_BYTES + MAX_FRAME * 2
+    HEADER_BYTES + MAX_FRAME * 3
 }
 
 /// Byte offset of the proxy region (the frame the layer hands the model) within the
@@ -82,3 +84,6 @@ pub const fn proxy_offset() -> usize {
 pub const fn answer_offset() -> usize {
     HEADER_BYTES + MAX_FRAME
 }
+
+/// Full-resolution R16G16_SFLOAT motion for the same seq_req as the proxy.
+pub const fn motion_offset() -> usize { HEADER_BYTES + MAX_FRAME * 2 }

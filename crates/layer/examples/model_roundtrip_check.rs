@@ -1,0 +1,63 @@
+//! Hardware release check. Requires the candidate helper on the same DLSSNR_SHM,
+//! a gameplay PNG argument, and an output directory argument. Never use the live SHM.
+#[path = "../src/optical_flow.rs"]
+mod optical_flow;
+use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::{Duration,Instant}};
+use dlssnr_protocol::{enums::proxy_format, mapping};
+fn save(path: &std::path::Path, pixels:&[u8],w:u32,h:u32) {
+    let mut enc=png::Encoder::new(File::create(path).unwrap(),w,h);
+    enc.set_color(png::ColorType::Rgba);enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(pixels).unwrap();
+}
+fn main() {
+    let args:Vec<_>=std::env::args().collect();
+    let out=std::path::Path::new(&args[2]);std::fs::create_dir_all(out).unwrap();
+    let mut reader=png::Decoder::new(File::open(&args[1]).unwrap()).read_info().unwrap();
+    let mut all=vec![0;reader.output_buffer_size()];let info=reader.next_frame(&mut all).unwrap();
+    assert_eq!(info.bit_depth,png::BitDepth::Eight);
+    let channels=match info.color_type {png::ColorType::Rgb=>3,png::ColorType::Rgba=>4,_=>panic!("RGB PNG required")};
+    let (w,h)=(512u32,512u32);assert!(info.width>=w && info.height>=h);
+    let (ox,oy)=((info.width-w)/2,(info.height-h)/2);
+    let mut pixels=vec![255u8;(w*h*4) as usize];
+    for y in 0..h {for x in 0..w {let src=(((y+oy)*info.width+x+ox)*channels) as usize;let dst=((y*w+x)*4) as usize;pixels[dst..dst+3].copy_from_slice(&all[src..src+3]);}}
+    save(&out.join("input.png"),&pixels,w,h);
+    let entry=unsafe {ash::Entry::load()}.unwrap();
+    let app=ash::vk::ApplicationInfo::builder().api_version(ash::vk::API_VERSION_1_3);
+    let instance=unsafe {entry.create_instance(&ash::vk::InstanceCreateInfo::builder().application_info(&app),None)}.unwrap();
+    let pd=unsafe {instance.enumerate_physical_devices()}.unwrap().into_iter().find(|&p| unsafe {instance.get_physical_device_properties(p)}.vendor_id==0x10de).unwrap();
+    let mut flow=optical_flow::OpticalFlow::new(&instance,pd,w,h,1).unwrap();
+    println!("motion quality={}",flow.quality);
+    let m=mapping::open().unwrap();let hdr=m.header();
+    let file=std::fs::OpenOptions::new().read(true).write(true).open(std::env::var("DLSSNR_SHM").unwrap()).unwrap();
+    let deadline=Instant::now()+Duration::from_secs(30);
+    while hdr.helper_state.load(Ordering::Acquire)!=dlssnr_protocol::enums::helper_state::RUNNING {
+        assert!(Instant::now()<deadline,"helper did not start");std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut outputs=vec![];
+    for (i,format) in [proxy_format::RGBA8,proxy_format::BGRA8].into_iter().enumerate() {
+        for frame in 0..2 {
+            let mut input=pixels.clone();
+            if frame==1 {for y in 0..h {for x in 8..w {let dst=((y*w+x)*4) as usize;input[dst..dst+4].copy_from_slice(&pixels[dst-32..dst-28]);}}}
+            let vectors=flow.estimate(&input,false).unwrap();
+            let motion=if frame==0 {None}else{vectors};
+            if format==proxy_format::BGRA8 {for p in input.chunks_exact_mut(4) {p.swap(0,2);}}
+            file.write_all_at(&input,dlssnr_protocol::proxy_offset() as u64).unwrap();
+            if let Some(v)=&motion {file.write_all_at(&dlssnr_protocol::motion::encode(v,[1.0,1.0]),dlssnr_protocol::motion_offset() as u64).unwrap();}
+            hdr.width.store(w,Ordering::Relaxed);hdr.height.store(h,Ordering::Relaxed);hdr.proxy_format.store(format,Ordering::Relaxed);
+            hdr.frame_mvec_valid.store(u32::from(motion.is_some()),Ordering::Relaxed);hdr.frame_mvec_scale_mode.store(1,Ordering::Relaxed);
+            let req=hdr.seq_req.load(Ordering::Relaxed)+1;let start=Instant::now();hdr.seq_req.store(req,Ordering::Release);
+            while hdr.seq_resp.load(Ordering::Acquire)!=req {assert!(start.elapsed()<Duration::from_secs(30),"request timed out");std::thread::sleep(Duration::from_millis(2));}
+            assert_eq!(hdr.model_up.load(Ordering::Relaxed),1,"model not available");
+            let mut answer=vec![0u8;input.len()];file.read_exact_at(&mut answer,dlssnr_protocol::answer_offset() as u64).unwrap();
+            if format==proxy_format::BGRA8 {for p in answer.chunks_exact_mut(4) {p.swap(0,2);}}
+            println!("format={format} frame={frame} response={:?}",start.elapsed());
+            save(&out.join(format!("output-{i}-{frame}.png")),&answer,w,h);
+            if frame==0 {outputs.push(answer);}
+        }
+    }
+    hdr.quit.store(1,Ordering::Release);
+    let diff=outputs[0].iter().zip(&outputs[1]).map(|(a,b)|a.abs_diff(*b) as u64).sum::<u64>() as f64 / outputs[0].len() as f64;
+    println!("RGBA/BGRA semantic mean absolute difference = {diff}");
+    assert!(diff<3.0,"RGBA/BGRA representations must produce comparable semantic colors");
+    drop(flow);unsafe {instance.destroy_instance(None)};
+}

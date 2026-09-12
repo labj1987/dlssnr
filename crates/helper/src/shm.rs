@@ -198,6 +198,11 @@ impl ShmMapping {
 
     /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes from the proxy region --
     /// the frame the layer captured, waiting to be evaluated.
+    pub fn read_motion(&self, out: &mut [u8]) {
+        let n = out.len().min(MAX_FRAME);
+        unsafe { std::ptr::copy_nonoverlapping(self.pixel_base().add(dlssnr_protocol::motion_offset()),out.as_mut_ptr(),n); }
+    }
+
     pub fn read_proxy(&self, out: &mut [u8]) -> usize {
         let n = out.len().min(MAX_FRAME);
         // SAFETY: `pixel_base()` is the start of this process's own mapping of the

@@ -60,25 +60,14 @@ pub fn is_supported_format(format: vk::Format) -> bool {
 /// duplicates it.
 pub fn proxy_format_for(format: vk::Format) -> u32 {
     match format {
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => dlssnr_protocol::enums::proxy_format::BGRA8,
         vk::Format::R16G16B16A16_SFLOAT => dlssnr_protocol::enums::proxy_format::RGBA16F,
         _ => dlssnr_protocol::enums::proxy_format::RGBA8,
     }
 }
 
-/// Whether `format`'s real per-texel byte order is B,G,R,A rather than R,G,B,A --
-/// `proxy_format_for` collapses both into the same `RGBA8` proxy format (a real,
-/// correct simplification for *size*: both are 4 bytes/pixel), but every consumer of
-/// the captured bytes (composition math, the debug PNG dump, the NGX model's own
-/// resource binding) needs the real channel order too, or it silently reads/writes
-/// red and blue swapped. Found and fixed 2026-09-11: `vkCmdCopyImageToBuffer`/
-/// `vkCmdCopyBufferToImage` are raw, format-preserving byte copies -- they never
-/// reorder channels -- so a `B8G8R8A8` swapchain (confirmed via real `vkcube`/game
-/// testing to be what this machine's driver actually hands out, not a hypothetical)
-/// produced bytes that every downstream consumer, hardcoded to assume `R8G8B8A8`
-/// order, silently misread -- a real, visible red/blue channel swap on real hardware,
-/// not a debug-dump-only cosmetic issue (the NGX model's own `DLSSNR.Color`/`.Output`
-/// resources are declared `R8G8B8A8_UNORM` in `crates/helper/src/frame.rs`, so it
-/// received/produced genuinely mislabeled color data too).
+/// Whether raw capture bytes are B,G,R,A. The protocol now preserves this
+/// format; composition still swizzles only its own pixel math, never SHM bytes.
 pub fn is_bgr_order(format: vk::Format) -> bool {
     matches!(format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB)
 }
@@ -101,5 +90,21 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
         hdr_kind::PQ10
     } else {
         hdr_kind::NONE
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use dlssnr_protocol::enums::proxy_format;
+    #[test]
+    fn raw_formats_preserve_channel_order_and_size() {
+        for f in [vk::Format::B8G8R8A8_UNORM,vk::Format::B8G8R8A8_SRGB] {
+            assert_eq!(proxy_format_for(f),proxy_format::BGRA8);
+            assert_eq!(proxy_format::bytes_per_pixel(proxy_format_for(f)),4);
+            assert!(proxy_format::is_8bit(proxy_format_for(f)));
+        }
+        assert_eq!(proxy_format_for(vk::Format::R8G8B8A8_UNORM),proxy_format::RGBA8);
+        assert!(!proxy_format::is_8bit(proxy_format::RGBA16F));
     }
 }

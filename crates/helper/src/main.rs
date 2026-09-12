@@ -84,14 +84,14 @@ fn main() {
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
     let mut proxy_buf: Vec<u8> = Vec::new();
     let mut answer_buf: Vec<u8> = Vec::new();
-    let mut last_seq_req = hdr.seq_req.load(Ordering::Relaxed);
+    let mut last_seq_req = hdr.seq_req.load(Ordering::Acquire);
     let mut frames: u64 = 0;
 
     loop {
         if hdr.quit.load(Ordering::Relaxed) != 0 {
             break;
         }
-        let seq_req = hdr.seq_req.load(Ordering::Relaxed);
+        let seq_req = hdr.seq_req.load(Ordering::Acquire);
         if seq_req != last_seq_req {
             last_seq_req = seq_req;
             let width = hdr.width.load(Ordering::Relaxed);
@@ -102,6 +102,12 @@ fn main() {
             proxy_buf.resize(bytes, 0);
             answer_buf.resize(bytes, 0);
             let n = shm.read_proxy(&mut proxy_buf);
+            let mut motion = Vec::new();
+            if hdr.frame_mvec_valid.load(Ordering::Relaxed) != 0 {
+                motion.resize((width as usize * height as usize * 4).min(dlssnr_protocol::MAX_FRAME),0);
+                shm.read_motion(&mut motion);
+            }
+            let motion_scale = dlssnr_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),width,height);
 
             let ready = ngx::ensure_feature(&mut snippet, &device, queue, width, height);
             if ready {
@@ -114,9 +120,9 @@ fn main() {
                 hdr.helper_state.store(dlssnr_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
             }
             let evaluated = ready
-                && proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8
+                && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format)
                 && (|| {
-                    if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height)) {
+                    if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
                         // SAFETY: any previous resources are no longer referenced by
                         // in-flight work -- `FrameResources::evaluate` always waits on
                         // its own fences before returning, so by the time we're back
@@ -124,11 +130,11 @@ fn main() {
                         if let Some(old) = frame_resources.take() {
                             unsafe { old.destroy(&device) };
                         }
-                        frame_resources = frame::FrameResources::new(&device, &instance, physical_device, 0, width, height);
+                        frame_resources = frame::FrameResources::new(&device, &instance, physical_device, 0, width, height, proxy_format);
                     }
                     let f = frame_resources.as_ref()?;
                     let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, &proxy_buf[..n], &mut answer_buf[..n]).then_some(())
+                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, &proxy_buf[..n], &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), &mut answer_buf[..n]).then_some(())
                 })()
                 .is_some();
             if !evaluated {
@@ -140,7 +146,7 @@ fn main() {
             }
             shm.write_answer(&answer_buf[..n]);
             hdr.seq_ok.store(seq_req, Ordering::Relaxed);
-            hdr.seq_resp.store(seq_req, Ordering::Relaxed);
+            hdr.seq_resp.store(seq_req, Ordering::Release);
             frames += 1;
             dlssnr_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, frames);
             dlssnr_helper::log!("[helper] frame {frames}: {width}x{height} evaluated={evaluated}");

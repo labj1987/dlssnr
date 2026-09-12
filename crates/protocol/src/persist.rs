@@ -48,6 +48,11 @@ mod tests {
         h.style.store(2, std::sync::atomic::Ordering::Relaxed);
         h.auto_mask.store(0, std::sync::atomic::Ordering::Relaxed);
 
+        h.white_point_source.store(1, std::sync::atomic::Ordering::Relaxed);
+        h.white_point_bits.store(2.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        h.white_point_scale_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        h.white_point_trim_bits.store(0.75f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        h.toggle_key.store(87, std::sync::atomic::Ordering::Relaxed);
         let snap = snapshot(h);
         assert_eq!(snap.get("set_intensity").map(String::as_str), Some("1.75"));
         assert_eq!(snap.get("set_style").map(String::as_str), Some("2"));
@@ -57,6 +62,7 @@ mod tests {
         assert_ne!(f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed)), 1.75);
 
         apply(h, &snap);
+        assert_eq!(snapshot(h),snap,"every setting, including HDR and hotkey, must survive reinitialization");
         assert_eq!(f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed)), 1.75);
         assert_eq!(h.style.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(h.auto_mask.load(std::sync::atomic::Ordering::Relaxed), 0);

@@ -36,6 +36,11 @@ pub struct CompositionSettings {
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
 /// per device, guarded by a `Mutex` in [`crate::device::DlssnrDeviceInfo`].
 pub struct ShmClient {
+    motion: Option<crate::optical_flow::OpticalFlow>,
+    motion_failed: Option<(u32,u32,u32,u32)>,
+    motion_luma: Vec<u8>,
+    motion_last: Option<Instant>,
+    motion_format: u32,
     fd: Option<OwnedFd>,
     header: *mut dlssnr_protocol::ShmHeader,
     path: String,
@@ -66,6 +71,11 @@ unsafe impl Send for ShmClient {}
 impl Default for ShmClient {
     fn default() -> Self {
         Self {
+            motion: None,
+            motion_failed: None,
+            motion_luma: Vec::new(),
+            motion_last: None,
+            motion_format: 0,
             fd: None,
             header: std::ptr::null_mut(),
             path: String::new(),
@@ -213,6 +223,50 @@ impl ShmClient {
                 n,
             );
         }
+    }
+
+    pub fn prepare_motion(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
+        width: u32, height: u32, format: u32, bytes: &[u8]) {
+        let Some(h) = self.header() else { return };
+        h.frame_mvec_valid.store(0, Ordering::Relaxed);
+        let enabled = h.mvec_enabled() && dlssnr_protocol::enums::proxy_format::is_8bit(format);
+        let quality = h.mvec_quality();
+        let mode = h.mvec_scale_mode();
+        if !enabled { self.motion = None; self.motion_last = None; self.motion_failed = None; self.motion_luma.clear(); return; }
+        if self.motion.as_ref().is_some_and(|m| m.width != width || m.height != height || m.quality != quality)
+            || self.motion_format != format || self.motion_last.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+            self.motion = None;
+        }
+        let key = (width,height,quality,format);
+        if self.motion_failed == Some(key) { return; }
+        if self.motion.is_none() {
+            match crate::optical_flow::OpticalFlow::new(instance,pd,width,height,quality) {
+                Ok(m) => { self.motion = Some(m); self.motion_format = format; },
+                Err(e) => { crate::log!("[mvec] unavailable: {e}"); self.motion_failed = Some(key); return; }
+            }
+        }
+        // Sample luminance to discard motion across a scene cut. Motion is not
+        // meaningful when the two captured frames depict unrelated scenes.
+        let luma: Vec<u8> = bytes.chunks_exact(4).step_by(64).map(|p| ((p[0] as u32 + 2*p[1] as u32 + p[2] as u32)/4) as u8).collect();
+        let cut = luma.len() == self.motion_luma.len() && !luma.is_empty()
+            && luma.iter().zip(&self.motion_luma).map(|(&a,&b)| a.abs_diff(b) as u64).sum::<u64>() > luma.len() as u64 * 64;
+        self.motion_luma = luma;
+        let bgr = format == dlssnr_protocol::enums::proxy_format::BGRA8;
+        match self.motion.as_mut().unwrap().estimate(bytes,bgr) {
+            Ok(Some(vectors)) if !cut => {
+                let payload = dlssnr_protocol::motion::encode(&vectors,dlssnr_protocol::motion::scales(mode,width,height));
+                if let Some(base) = self.pixel_base() {
+                    // Same single-request ownership and bounds as write_proxy.
+                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),base.add(dlssnr_protocol::motion_offset()),payload.len()); }
+                    let h = self.header().unwrap();
+                    h.frame_mvec_scale_mode.store(mode,Ordering::Relaxed);
+                    h.frame_mvec_valid.store(1,Ordering::Relaxed);
+                }
+            },
+            Ok(_) => {},
+            Err(e) => { crate::log!("[mvec] failed: {e}"); self.motion = None; self.motion_failed = Some(key); },
+        }
+        self.motion_last = Some(Instant::now());
     }
 
     /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes back from the answer
@@ -760,5 +814,44 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!ensure_private_parent_dir(&format!("{dir}/shm.bin")));
+    }
+}
+
+#[cfg(test)]
+mod motion_transport_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a real NVIDIA optical-flow GPU"]
+    fn real_motion_payload_is_published_with_the_frame() {
+        let entry = unsafe { ash::Entry::load() }.unwrap();
+        let app = ash::vk::ApplicationInfo::builder().api_version(ash::vk::API_VERSION_1_3);
+        let instance = unsafe {entry.create_instance(&ash::vk::InstanceCreateInfo::builder().application_info(&app),None)}.unwrap();
+        let pd = unsafe {instance.enumerate_physical_devices()}.unwrap().into_iter().find(|&p|
+            unsafe {instance.get_physical_device_properties(p)}.vendor_id == 0x10de).expect("NVIDIA GPU required");
+        let path = format!("/tmp/dlssnr-motion-transport-{}/shm.bin",std::process::id());
+        let mut client = ShmClient::default();
+        assert!(client.open_at(&path));
+        let mut pixels = vec![0u8;512*512*4];
+        for (i,p) in pixels.chunks_exact_mut(4).enumerate() { let v = ((i as u32).wrapping_mul(747796405) >> 24) as u8; p.copy_from_slice(&[v,v,v,255]); }
+        let format = dlssnr_protocol::enums::proxy_format::BGRA8;
+        client.set_frame_info(512,512,format);
+        client.write_proxy(&pixels);
+        client.prepare_motion(&instance,pd,512,512,format,&pixels);
+        assert_eq!(client.header().unwrap().frame_mvec_valid.load(Ordering::Relaxed),0);
+        client.prepare_motion(&instance,pd,512,512,format,&pixels);
+        let hdr = client.header().unwrap();
+        assert_eq!(hdr.frame_mvec_valid.load(Ordering::Relaxed),1);
+        assert_eq!(hdr.proxy_format.load(Ordering::Relaxed),format);
+        assert_eq!(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),dlssnr_protocol::enums::mvec_scale_mode::PIXELS);
+        let payload = unsafe {std::slice::from_raw_parts(client.pixel_base().unwrap().add(dlssnr_protocol::motion_offset()),512*512*4)};
+        assert!(payload.iter().filter(|&&x| x == 0).count() > payload.len()*95/100,"stationary motion should be near zero after the deadzone");
+        hdr.mvec_enabled.store(0,Ordering::Relaxed);
+        client.prepare_motion(&instance,pd,512,512,format,&pixels);
+        assert_eq!(client.header().unwrap().frame_mvec_valid.load(Ordering::Relaxed),0);
+        assert!(client.motion.is_none());
+        drop(client);
+        unsafe {instance.destroy_instance(None)};
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).ok();
     }
 }

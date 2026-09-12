@@ -373,6 +373,7 @@ pub unsafe fn run(
         if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
             shm.set_frame_info(width, height, proxy_format);
             shm.write_proxy(original_scratch);
+            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
             if shm.begin_async_request() {
                 std::mem::swap(&mut inflight.original, original_scratch);
                 inflight.dims = Some((width, height, proxy_format));
@@ -391,7 +392,7 @@ pub unsafe fn run(
     if inflight.dims != Some((width, height, proxy_format)) {
         return None;
     }
-    if proxy_format != dlssnr_protocol::enums::proxy_format::RGBA8 {
+    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // `RGBA16F` has no composition path at all yet (see `composition::apply`'s own
         // doc comment) -- nothing to do with a fresh answer for it here.
         return None;
@@ -829,6 +830,7 @@ unsafe fn run_sync(
     let t_write_proxy_start = std::time::Instant::now();
     shm.set_frame_info(width, height, proxy_format);
     shm.write_proxy(captured);
+    shm.prepare_motion(instance, physical_device, width, height, proxy_format, captured);
     let t_write_proxy = t_write_proxy_start.elapsed();
     let t_roundtrip_start = std::time::Instant::now();
     let answered = shm.try_round_trip();
@@ -850,7 +852,7 @@ unsafe fn run_sync(
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
         // `dlssnr_protocol::enums::proxy_format` for the format codes).
-        if proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8 {
+        if dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
             if let Some(settings) = shm.composition_settings() {
                 if settings.apply_model {
                     // GPU dispatch (`composition::gpu`) only implements the normal
@@ -960,7 +962,7 @@ unsafe fn run_sync(
     // (identical) matched pair rather than silently doing nothing -- `write_pair`
     // itself is the only place that would need to special-case a format it can't
     // encode, and today it always gets `RGBA8` bytes either way.
-    if shm.take_capture_request() && proxy_format == dlssnr_protocol::enums::proxy_format::RGBA8 {
+    if shm.take_capture_request() && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // SAFETY: same reasoning as every other read of `r.ptr` in this function --
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.

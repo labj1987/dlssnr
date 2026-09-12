@@ -1,3 +1,40 @@
+# 2026-09-11 follow-up implementation (unreleased)
+
+This section supersedes the historical open-item descriptions below.
+
+- SHM v2 preserves BGRA8 separately from RGBA8. Helper Color/Output formats and
+  resource reuse now include the captured format. Layer composition retains its
+  existing swizzle; raw SHM bytes are never swizzled twice.
+- Native optical flow runs in the layer, on a private Vulkan device on the same
+  physical GPU. It explicitly requests opticalFlow and synchronization2 and a
+  queue supporting both OPTICAL_FLOW and TRANSFER; it does not alter the game's
+  device create chain. Captured proxies are uploaded to two BGRA input images.
+  These are consecutive **captured/model-input frames**, not necessarily adjacent
+  presents in the existing asynchronous pipeline. Current-to-previous flow is
+  expanded from the hardware grid, converted from signed fixed-point /32 to
+  R16G16_SFLOAT, deadzoned below 0.5 pixels, and sent in a third sparse SHM region.
+  Motion quality and units are honored. Unsupported devices fail open without
+  repeatedly trying the same configuration. Resize, format/quality changes,
+  disabling motion, and gaps over one second discard history; detected scene cuts
+  discard vectors. The helper resets temporal history when expected vectors are
+  absent. Optical flow uses host staging and waits on its private queue; FPS impact
+  in real gameplay has not been measured. Async composition remains the default.
+- HDR white-point source/manual value/scale/trim and a key-capture/clear widget are
+  bound and persisted (36 settings). Escape cancels capture; focus loss cancels;
+  Linux XKB hardware codes are converted to evdev codes. The UI explicitly says
+  that existing HDR processing and in-game hotkey polling are still unimplemented;
+  these changes implement the handoff's GUI-binding scope, not those larger paths.
+- Validation: protocol/layer tests, GUI checks/tests, Windows helper cross-build,
+  loader smoke test, and dedicated RTX 5070 optical-flow/SHM checks. The GPU
+  translation check produced median (-8,0) for an 8-pixel right shift and stationary
+  mean absolute component sum 0.02483368 pixels. No live-game A/B capture, HDR
+  visual verification, release, or deployment was performed for this patch.
+- All participating binaries must be rebuilt/restarted together for SHM v2.
+  Header size is 1960; appended motion validity/units offsets are 1952/1956.
+  The full mapping now reserves header + 3*MAX_FRAME (sparse). Never mix v1/v2
+  processes on the same mapping. The existing mapping-open policy reinitializes
+  mismatched headers; stop old participants before starting a v2 build.
+
 # dlssnr (working codename)
 
 A from-scratch Rust/GTK4/libadwaita rebuild of

@@ -281,6 +281,10 @@ pub struct ShmHeader {
     /// made: the layer writes this immediately before `seq_req`, so the helper reads
     /// the width from the same statement that announced the pixels.
     pub hdr_encode: AtomicU32,
+    /// Motion payload is valid for this request; published before seq_req.
+    pub frame_mvec_valid: AtomicU32,
+    /// Snapshot of units used to encode this request, independent of GUI changes.
+    pub frame_mvec_scale_mode: AtomicU32,
 }
 
 // The whole point of a shared, memory-mapped struct like this is that every writer
@@ -312,7 +316,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1952, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1960, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -322,6 +326,8 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 176, "lay
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 780, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1860, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_valid) == 1952, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_scale_mode) == 1956, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
@@ -432,6 +438,8 @@ impl ShmHeader {
         self.hdr_active.store(0, Ordering::Relaxed);
         self.proxy_format.store(crate::enums::proxy_format::RGBA8, Ordering::Relaxed);
         self.hdr_encode.store(0, Ordering::Relaxed);
+        self.frame_mvec_valid.store(0, Ordering::Relaxed);
+        self.frame_mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -444,8 +452,13 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 31] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 36] {
         [
+            ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
+            ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
+            ("white_point_trim", true, self.white_point_trim_bits.load(Ordering::Relaxed)),
+            ("white_point_source", false, self.white_point_source.load(Ordering::Relaxed)),
+            ("toggle_key", false, self.toggle_key.load(Ordering::Relaxed)),
             ("enabled", false, self.enabled.load(Ordering::Relaxed)),
             ("style", false, self.style.load(Ordering::Relaxed)),
             ("preset", false, self.preset.load(Ordering::Relaxed)),
@@ -488,6 +501,11 @@ impl ShmHeader {
     /// second field).
     pub fn apply_persisted_setting(&self, name: &str, bits: u32) {
         let field = match name {
+            "white_point" => &self.white_point_bits,
+            "white_point_scale" => &self.white_point_scale_bits,
+            "white_point_trim" => &self.white_point_trim_bits,
+            "white_point_source" => &self.white_point_source,
+            "toggle_key" => &self.toggle_key,
             "enabled" => &self.enabled,
             "style" => &self.style,
             "preset" => &self.preset,

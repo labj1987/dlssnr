@@ -28,6 +28,7 @@
 //! blunt, documented-as-such filter for that, not a real fix.
 
 mod capture;
+mod optical_flow;
 mod composition;
 mod device;
 mod dump;
