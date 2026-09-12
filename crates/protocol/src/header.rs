@@ -417,7 +417,9 @@ impl ShmHeader {
         self.mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
         self.mvec_quality.store(mvec_quality::BALANCED, Ordering::Relaxed);
         self.seq_ok.store(0, Ordering::Relaxed);
-        self.composition_bypass.store(1, Ordering::Relaxed);
+        // Neural rendering should affect the presented image by default. A
+        // bypassed composition is an explicit debug choice, not the normal mode.
+        self.composition_bypass.store(0, Ordering::Relaxed);
         self.rebuild_settle_ms.store(250, Ordering::Relaxed);
         self.answered_w.store(0, Ordering::Relaxed);
         self.answered_h.store(0, Ordering::Relaxed);
@@ -719,7 +721,7 @@ mod tests {
         assert_eq!(h.resolved_passes(), 1);
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
         // Bypass is on until the user turns composition on.
-        assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 1);
+        assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 0);
     }
 
     #[test]
