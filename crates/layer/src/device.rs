@@ -116,6 +116,7 @@ struct State {
     /// `capture::run` reads back once a round trip resolves.
     answer_scratch: Vec<u8>,
     last_answer: Vec<u8>,
+    hotkey: crate::hotkey::Poller,
 }
 
 impl DlssnrDeviceInfo {
@@ -369,7 +370,8 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
-                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, .. } = &mut *state;
+                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
+                shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will

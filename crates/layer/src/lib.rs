@@ -33,6 +33,7 @@ mod composition;
 mod device;
 mod dump;
 mod logging;
+mod hotkey;
 mod shm;
 mod swapchain;
 

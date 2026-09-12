@@ -200,7 +200,12 @@ void main() {
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
 
   if (params.carry_delta != 0u) {
-    vec3 encoded = SrgbEncode(clamp(original + (model - proxy), 0.0, 1.0));
+    // A model result belongs to `proxy`'s older frame.  Carry its delta only
+    // where the current pixel still resembles that source: camera movement then
+    // presents the clean current frame instead of dragging old scenery across it.
+    float motion = max(max(abs(original.r - proxy.r), abs(original.g - proxy.g)), abs(original.b - proxy.b));
+    float stability = 1.0 - smoothstep(0.015, 0.10, motion);
+    vec3 encoded = SrgbEncode(clamp(original + (model - proxy) * stability, 0.0, 1.0));
     imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, 1.0));
     return;
   }

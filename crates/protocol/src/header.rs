@@ -377,7 +377,8 @@ impl ShmHeader {
         self.compare_swap.store(0, Ordering::Relaxed);
         self.colour_mode.store(crate::enums::colour_mode::AUTO, Ordering::Relaxed);
         self.capture_request.store(0, Ordering::Relaxed);
-        self.toggle_key.store(0, Ordering::Relaxed);
+        // F11 is Linux evdev code 87 and is available in-game on XWayland.
+        self.toggle_key.store(87, Ordering::Relaxed);
         self.reversible_mode.store(crate::enums::reversible_mode::KNEE, Ordering::Relaxed);
         self.apply_model.store(1, Ordering::Relaxed);
         self.hold_frame.store(0, Ordering::Relaxed);

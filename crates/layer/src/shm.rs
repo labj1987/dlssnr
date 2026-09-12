@@ -171,6 +171,20 @@ impl ShmClient {
     /// The settings `composition::apply::apply_rgba8` needs, read fresh every frame
     /// (each is a single atomic load) so a live GUI change takes effect on the very
     /// next present rather than needing a restart. `None` before the mapping is open.
+    /// Applies the configured in-game toggle on a physical key press.  It changes
+    /// the same shared atomic the GUI uses, so the helper and layer agree immediately.
+    pub fn poll_toggle_hotkey(&mut self, poller: &mut crate::hotkey::Poller) {
+        let Some(hdr) = self.header() else { return };
+        // Existing installations may have persisted the historical default `0`.
+        // Treat it as F11 as well, so the new in-game control works immediately.
+        let configured = hdr.toggle_key.load(Ordering::Relaxed);
+        let key = if configured == 0 { 87 } else { configured };
+        if poller.pressed(key) {
+            let enabled = hdr.enabled.load(Ordering::Relaxed);
+            hdr.enabled.store((enabled == 0) as u32, Ordering::Relaxed);
+        }
+    }
+
     pub fn composition_settings(&self) -> Option<CompositionSettings> {
         let hdr = self.header()?;
         Some(CompositionSettings {
