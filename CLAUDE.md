@@ -1,3 +1,65 @@
+# 2026-09-12 (later the same day): a real UB/hang bug found in `capture_pristine`,
+# fixed -- the ~22x FPS regression's likely root cause, not fully confirmed live
+
+**What was found**: `crates/layer/src/capture.rs`'s `capture_pristine` (the *synchronous*
+stage-1 capture the async `run()` path still always pays for once per round-trip
+cycle -- its own module doc comment already called this "no way around blocking on
+it") unconditionally called `device.reset_command_buffer` on `r.cmd` every cycle, on
+the sole assumption -- stated as a hard safety invariant in both its own and
+`ensure()`'s doc comments -- that the *previous* cycle's submission against
+`r.fence` had already been waited on to completion. That wait used `u64::MAX`
+(unbounded). On real `lordnikon` hardware this did not reliably complete anywhere
+near the "a few milliseconds" measured 2026-09-10: A/B'ing `enabled` twice on a real
+GTA V Enhanced session (see the section above) showed FPS collapse from 196-274 to a
+steady 9 the instant neural rendering turned on, with GPU utilization *dropping*
+(21-26% vs. 99%) -- the signature of CPU-side blocking, not more real GPU work. A
+`vkcube --width 1920 --height 1080` test under the same layer (needed to clear
+`swapchain::is_plausible_game_size`'s 1280x720 floor, `vkcube`'s own default 500x500
+window hits the `pass_through` path and never exercises this code at all) stalled
+almost completely after its own very first frame -- single-threaded, so this is not
+a multi-thread queue race, just this wait never returning promptly. Resetting a
+command buffer whose previous submission has not actually finished is undefined
+behavior per the Vulkan spec, independent of how slow that made things -- the
+unbounded wait was not just a perf bug, it was silently relying on a completion
+guarantee this code could not actually make on this hardware.
+
+**The fix**: `capture_pristine` now does a non-blocking `get_fence_status` check at
+entry and skips the whole cycle (same fail-open discipline as every other failure
+path in this module) if the previous submission's fence is not yet signaled, rather
+than resetting possibly-in-flight resources. `ensure()`'s resize/rebuild path (queue
+family change or a capacity increase, destroying and recreating `CaptureResources`)
+had the identical latent UB and got the identical guard. The one remaining
+`wait_for_fences` in `capture_pristine` -- for the fresh submission this same call
+just made -- is now bounded (`CAPTURE_FENCE_TIMEOUT_NS`, 8ms, generous relative to
+the "a few ms" 2026-09-10 measurement) instead of `u64::MAX`, so a real stall costs
+`vkQueuePresentKHR` at most that much once, fails open, and is safe to retry next
+cycle precisely because the new entry check now correctly detects "still pending"
+instead of blindly reusing the resources. `run_sync`'s own two `wait_for_fences`
+calls (used only for `debug_view`/`capture_request`, not the path this regression is
+in) were deliberately left unbounded -- not proven broken, and stage 2 specifically
+writes into the swapchain image itself right before the real present call, where a
+timeout would leave `image` in a genuinely unknown state rather than a safe "skip
+this cycle."
+
+**Verified**: full `cargo test` (default members) green, `scripts/smoke-test.sh`
+green. **Not verified**: a second live GTA V Enhanced session against this build --
+every relaunch attempt after the first successful one this session (a direct-Proton
+bypass, and four separate `steam://rungameid` relaunches, including one that
+eventually got far enough to spawn the real Rockstar Games Launcher/Social Club
+process tree before it too fully exited) failed to reach sustained gameplay again,
+Rockstar Games Launcher's own full process tree exiting completely each time --
+this reproduced identically both before and after this fix was deployed, strongly
+suggesting RGL itself refusing rapid successive relaunches (a real, separate,
+external annoyance, not a `dlssnr` bug) rather than anything this change touched.
+**So**: the reasoning for why this fix should substantially help is sound and
+consistent with every real measurement gathered (the deployed layer during all of
+today's measurements, including the one working GTA session, never queried this
+code path with the fix in place), but the actual post-fix FPS number in a real
+sustained game session is not yet confirmed. Re-test once RGL cooperates; if 9fps
+somehow persists even with this fix, the next place to look is why the *fresh*
+submission's own bounded wait is still not completing within 8ms, not this entry
+guard (which only concerns *stale*, not fresh, work).
+
 # 2026-09-12: GUI retabbed like upstream, and a real conflict found chasing
 # "games freeze or crash" on `lordnikon`
 
