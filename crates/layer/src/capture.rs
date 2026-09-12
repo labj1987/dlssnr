@@ -383,51 +383,55 @@ pub unsafe fn run(
         return None;
     }
 
-    // Keep the most recent real model output.  The helper runs far below the
-    // presentation rate, but compositing only on the one frame where an answer
-    // arrives makes the screen alternate between enhanced and clean frames.  A
-    // current pristine capture plus this retained answer keeps the enhancement on
-    // every presented frame; its model result is only a few frames old.
-    if shm.has_pending_request() && shm.poll_async_request() == Some(true) {
-        answer_scratch.resize(frame_bytes as usize, 0);
-        shm.read_answer(answer_scratch);
-        if inflight.dims == Some((width, height, proxy_format)) {
-            last_answer.clear();
-            last_answer.extend_from_slice(answer_scratch);
+    // Poll whatever was sent on some earlier frame *before* touching anything else --
+    // `inflight`'s current contents correspond to it, and must be read (below) before
+    // a new capture this same frame (if one happens) is allowed to replace them.
+    let mut have_answer = false;
+    if shm.has_pending_request() {
+        if shm.poll_async_request() == Some(true) {
+            answer_scratch.resize(frame_bytes as usize, 0);
+            shm.read_answer(answer_scratch);
+            have_answer = true;
         }
     }
 
-    // Capture the current frame even while an evaluation is in flight.  This is the
-    // current frame that will be composed with the retained model answer below, and
-    // it is deliberately captured before any write-back can alter the swapchain.
-    if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-        return None;
-    }
-    let r = resources.as_ref().expect("just ensured above");
-    if !capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
-        return None;
-    }
-
-    // The shared-memory transport permits one request at a time.  Retain a copy for
-    // validating the answer's dimensions, then immediately keep using the current
-    // capture for composition rather than waiting for the next answer frame.
+    // Capture and send a new frame if (and only if) nothing is currently in flight --
+    // the wire protocol has only ever supported one outstanding request at a time.
+    // Deliberately *before* compositing below: compositing overwrites `image`, and
+    // this capture needs the game's real, unmodified rendering for this frame, not
+    // whatever this same call is about to paint over it.
     if !shm.has_pending_request() {
-        shm.set_frame_info(width, height, proxy_format);
-        shm.write_proxy(original_scratch);
-        shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-        if shm.begin_async_request() {
-            inflight.original.clear();
-            inflight.original.extend_from_slice(original_scratch);
-            inflight.dims = Some((width, height, proxy_format));
+        if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
+            return None;
+        }
+        let r = resources.as_ref().expect("just ensured above");
+        if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
+            shm.set_frame_info(width, height, proxy_format);
+            shm.write_proxy(original_scratch);
+            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+            if shm.begin_async_request() {
+                std::mem::swap(&mut inflight.original, original_scratch);
+                inflight.dims = Some((width, height, proxy_format));
+            }
         }
     }
 
-    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format)
-        || last_answer.len() != frame_bytes as usize
-    {
+    if !have_answer {
         return None;
     }
-
+    // A resolution (or format) change between when `inflight` was captured and now
+    // means its bytes describe a differently-sized frame -- compositing them against
+    // `image` at today's dimensions would read/write out of step with reality.
+    // Discard rather than risk it; `inflight` gets overwritten by the next successful
+    // capture above regardless.
+    if inflight.dims != Some((width, height, proxy_format)) {
+        return None;
+    }
+    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        // `RGBA16F` has no composition path at all yet (see `composition::apply`'s own
+        // doc comment) -- nothing to do with a fresh answer for it here.
+        return None;
+    }
 
     if gpu_compose.is_none() {
         *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
@@ -440,8 +444,8 @@ pub unsafe fn run(
             queue,
             width,
             height,
-            original_scratch,
-            last_answer,
+            &inflight.original,
+            answer_scratch,
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
@@ -460,8 +464,8 @@ pub unsafe fn run(
             queue,
             width,
             height,
-            original_scratch,
-            last_answer,
+            &inflight.original,
+            answer_scratch,
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
@@ -478,7 +482,7 @@ pub unsafe fn run(
     answer_scratch.clear();
     answer_scratch.extend_from_slice(last_answer);
     crate::composition::apply::apply_rgba8(
-        original_scratch,
+        &inflight.original,
         answer_scratch,
         settings.colour_strength,
         settings.transfer_strength,
