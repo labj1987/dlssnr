@@ -92,6 +92,18 @@ impl Default for ShmClient {
 }
 
 impl ShmClient {
+    /// Prepare the optical-flow session before the present hot path.
+    pub fn prepare_motion_resources(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
+        width: u32, height: u32, format: u32) {
+        let Some(h) = self.header() else { return };
+        if !h.mvec_enabled() || !dlssnr_protocol::enums::proxy_format::is_8bit(format) || self.motion.is_some() { return; }
+        let quality = h.mvec_quality();
+        match crate::optical_flow::OpticalFlow::new(instance, pd, width, height, quality) {
+            Ok(m) => { self.motion = Some(m); self.motion_format = format; }
+            Err(e) => { crate::log!("[mvec] unavailable during swapchain setup: {e}"); }
+        }
+    }
+
     /// Cross-module test access to the raw header pointer -- `capture::tests` needs
     /// to poke `helper_state`/`seq_resp` directly to stand in for a fake helper, the
     /// same way this module's own tests do, but `header` is private to this module
@@ -247,10 +259,10 @@ impl ShmClient {
         let key = (width,height,quality,format);
         if self.motion_failed == Some(key) { return; }
         if self.motion.is_none() {
-            match crate::optical_flow::OpticalFlow::new(instance,pd,width,height,quality) {
-                Ok(m) => { self.motion = Some(m); self.motion_format = format; },
-                Err(e) => { crate::log!("[mvec] unavailable: {e}"); self.motion_failed = Some(key); return; }
-            }
+            // Session creation is deliberately restricted to swapchain setup;
+            // never create a Vulkan device from the present callback.
+            let _ = (instance, pd);
+            return;
         }
         // Sample luminance to discard motion across a scene cut. Motion is not
         // meaningful when the two captured frames depict unrelated scenes.
