@@ -1,3 +1,40 @@
+# 2026-09-12: GUI retabbed like upstream, and a real conflict found chasing
+# "games freeze or crash" on `lordnikon`
+
+- `gui/src/ui.rs`: the settings window is now an `AdwViewStack` of five tabs (Model,
+  Motion, Composition — including the HDR white-point group, Debug, Status) instead
+  of one long scrolling `AdwPreferencesPage`, matching upstream's own Qt tab layout.
+  Uses `AdwViewSwitcherTitle` in the header bar plus an `AdwViewSwitcherBar` that
+  reveals at narrow widths (`title-visible` property-bound between the two) — the
+  standard adaptive pattern, verified by real screenshots at the default 620px width
+  (bottom bar active) clicking through all five tabs. `ViewSwitcherTitle`/`Bar` are
+  deprecated since libadwaita 1.4 in favor of `AdwBreakpoint`, kept anyway since the
+  replacement needs a newer libadwaita than this project's `v1_4`/`v1_5` feature gate
+  targets (see the gtk4/libadwaita CI-vs-local gotcha). Each tab's icon name
+  (`applications-graphics-symbolic`, `camera-video-symbolic`, `view-paged-symbolic`,
+  `edit-find-symbolic`, `network-transmit-receive-symbolic`) was checked against
+  `/usr/share/icons/Adwaita` specifically, not whatever distro theme (Yaru/Numix) is
+  active on the dev machine, after a first attempt with un-verified names rendered as
+  GTK's broken-icon glyph — confirmed by screenshot, not just plausible-looking code.
+- **Real, separate bug found while investigating "games either freeze or crash" on
+  `lordnikon`**: upstream's real C++ package (`dlssnr` 0.2.6-3, apt, installed
+  2026-09-11 for the earlier behavior-comparison session) was still installed and its
+  `dlssnr-gui`/`dlssnr-helper` were still *running* at the same time as this
+  rebuild's AppImage. Both implicit Vulkan layers register the same
+  `enable_environment`/`disable_environment` trigger (`VKLayer_DLSS5`/
+  `DLSSNR_DISABLE`) by design — this rebuild is meant to be a drop-in for upstream's
+  own trigger — and both helpers target the exact same `/tmp/dlssnr-$UID/shm.bin`
+  path. Any game launched with `VKLayer_DLSS5=1` therefore loaded *both* layers into
+  the same process, both racing to init/write the same mapping (one in upstream's
+  format, one in this project's v2 header) — a strong, sufficient explanation for
+  freezes/crashes on its own, independent of anything in the new v0.1.31 optical-flow/
+  SHM-v2 code. Fix: uninstalled the upstream apt package on `lordnikon`
+  (`sudo apt remove dlssnr`) rather than renaming this project's trigger env vars,
+  since the whole point of sharing them is drop-in compatibility with a machine that
+  isn't also running upstream. **Not yet done**: a live game re-test after the
+  uninstall — this was found before that could happen; the freeze/crash may or may not
+  have other causes underneath it once this conflict is removed.
+
 # 2026-09-11 follow-up implementation (unreleased)
 
 This section supersedes the historical open-item descriptions below.

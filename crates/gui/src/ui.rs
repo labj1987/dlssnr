@@ -1,7 +1,7 @@
-//! The settings UI: one row per `ShmHeader` setting, grouped the way upstream's Qt
-//! GUI grouped them (Model, Motion, Composition, Status) — used as a checklist of
-//! what has to exist, not as layout code to port; a per-field `QCheckBox`/`QSpinBox`
-//! binder has no logic worth transliterating either way.
+//! The settings UI: one row per `ShmHeader` setting, grouped and tabbed the way
+//! upstream's Qt GUI does (Model, Motion, Composition, Status) — used as a checklist
+//! of what has to exist, not as layout code to port; a per-field `QCheckBox`/
+//! `QSpinBox` binder has no logic worth transliterating either way.
 
 use std::sync::atomic::Ordering;
 
@@ -116,8 +116,6 @@ pub fn build_ui(app: &adw::Application) {
         return;
     };
     let shm = shm.0;
-
-    let page = adw::PreferencesPage::new();
 
     // --- Model -------------------------------------------------------------------
     let model_group = adw::PreferencesGroup::new();
@@ -268,26 +266,67 @@ pub fn build_ui(app: &adw::Application) {
 
     let toasts = adw::ToastOverlay::new();
 
-    page.add(&model_group);
-    page.add(&motion_group);
-    page.add(&comp_group);
-    page.add(&hdr_group);
-    page.add(&debug_group);
-    page.add(&build_status_group(&shm, &toasts));
+    // Tabbed like upstream's Qt GUI, rather than one long scrolling page -- each tab
+    // is still an AdwPreferencesPage, which scrolls internally on its own if its
+    // content overflows the window.
+    let view_stack = adw::ViewStack::new();
+    view_stack.set_vexpand(true);
+
+    let model_page = adw::PreferencesPage::new();
+    model_page.add(&model_group);
+    view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
+
+    let motion_page = adw::PreferencesPage::new();
+    motion_page.add(&motion_group);
+    view_stack.add_titled_with_icon(&motion_page, Some("motion"), "Motion", "camera-video-symbolic");
+
+    let composition_page = adw::PreferencesPage::new();
+    composition_page.add(&comp_group);
+    composition_page.add(&hdr_group);
+    view_stack.add_titled_with_icon(&composition_page, Some("composition"), "Composition", "view-paged-symbolic");
+
+    let debug_page = adw::PreferencesPage::new();
+    debug_page.add(&debug_group);
+    // Short tab label -- the group's own title inside the page ("Compare and debug")
+    // carries the full wording; ViewSwitcher button labels are cramped for five tabs
+    // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
+    view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
+
+    let status_page = adw::PreferencesPage::new();
+    status_page.add(&build_status_group(&shm, &toasts));
+    view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
+
+    // Deprecated since libadwaita 1.4 in favor of AdwBreakpoint, but that replacement
+    // needs a newer libadwaita than this project targets (see the gtk4/libadwaita
+    // feature-flag gotcha elsewhere in this codebase) -- ViewSwitcherTitle/Bar still
+    // work and are the version-compatible choice.
+    let switcher_title = adw::ViewSwitcherTitle::new();
+    switcher_title.set_stack(Some(&view_stack));
+    switcher_title.set_title("dlssnr");
 
     let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&switcher_title));
     let about_btn = gtk4::Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
     header.pack_end(&about_btn);
+
+    // Collapses into the header's switcher above when there's room, otherwise
+    // reveals this bar -- the standard adaptive pattern so the window can still be
+    // narrowed without the tab bar becoming unusable.
+    let switcher_bar = adw::ViewSwitcherBar::new();
+    switcher_bar.set_stack(Some(&view_stack));
+    switcher_title.bind_property("title-visible", &switcher_bar, "reveal").build();
+
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
-    content.append(&page);
+    content.append(&view_stack);
+    content.append(&switcher_bar);
     toasts.set_child(Some(&content));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("dlssnr")
         .default_width(620)
-        .default_height(760)
+        .default_height(700)
         .content(&toasts)
         .build();
 
