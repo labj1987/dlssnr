@@ -109,10 +109,33 @@ fn main() {
             }
             let motion_scale = dlssnr_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),width,height);
 
-            let ready = ngx::ensure_feature(&mut snippet, &device, queue, width, height);
+            let model_requested = hdr.neural_enabled()
+                && hdr.apply_model.load(Ordering::Relaxed) != 0;
+            // Reserve the frame-sized Vulkan images as soon as the layer sees the
+            // game's real swapchain, but do not enter the proprietary NGX runtime
+            // while NR is switched off.  GTA is still bringing up its own GPU work at
+            // that point; calling CreateFeature there has been observed to hang.  The
+            // resource reservation itself is safe, makes later activation possible
+            // even after GTA fills VRAM, and performs no model work or write-back.
+            if !model_requested
+                && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format)
+                && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
+            {
+                if let Some(old) = frame_resources.take() {
+                    unsafe { old.destroy(&device) };
+                }
+                frame_resources = frame::FrameResources::new(
+                    &device, &instance, physical_device, 0, width, height, proxy_format,
+                );
+                dlssnr_helper::log!(
+                    "[helper] prewarmed {}x{} frame resources: {}",
+                    width, height, frame_resources.is_some()
+                );
+            }
+            let ready = model_requested && ngx::ensure_feature(&mut snippet, &device, queue, width, height);
             if ready {
                 hdr.model_up.store(1, Ordering::Relaxed);
-            } else if snippet.disabled {
+            } else if model_requested && snippet.disabled {
                 // `ensure_feature` only ever disables the snippet after a real,
                 // one-shot `CreateFeature` attempt (see its own doc comment) -- worth
                 // surfacing in status immediately rather than leaving `RUNNING`
