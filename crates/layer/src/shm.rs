@@ -95,6 +95,12 @@ impl ShmClient {
     /// Prepare the optical-flow session before the present hot path.
     pub fn prepare_motion_resources(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
         width: u32, height: u32, format: u32) {
+        // The NVIDIA driver still crashes when this private optical-flow device
+        // is created during a live game's swapchain transition. Keep motion
+        // vectors disabled; neural rendering itself does not require this path.
+        let _ = (instance, pd, width, height, format);
+        return;
+        #[allow(unreachable_code)]
         let Some(h) = self.header() else { return };
         if !h.mvec_enabled() || !dlssnr_protocol::enums::proxy_format::is_8bit(format) || self.motion.is_some() { return; }
         let quality = h.mvec_quality();
