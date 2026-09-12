@@ -693,7 +693,11 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
     if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
         return;
     }
-    let _ = unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) };
+    // Bounded, same reasoning as `CAPTURE_FENCE_TIMEOUT_NS` above -- this is the
+    // last-resort CPU-compose fallback `run()` reaches when the GPU compose paths
+    // above have already failed/timed out; leaving this one wait unbounded would
+    // still let the present hook hang here instead.
+    let _ = unsafe { device.wait_for_fences(&[r.fence], true, CAPTURE_FENCE_TIMEOUT_NS) };
 }
 
 /// Captures `image` into the proxy region, runs the shared-memory round trip, and

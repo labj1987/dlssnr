@@ -1,3 +1,71 @@
+# 2026-09-12 (later still): two more real bugs found live -- a silent, session-wide
+# permission bug that fully disabled neural rendering, and the v0.1.33 fix's own gap
+
+**v0.1.33 was verified against real gameplay for the first time, and it worked --
+briefly.** After `chmod 700 /tmp/dlssnr-1000` (the directory's mode was `0775`,
+refused by `dlssnr_layer::shm::ensure_private_parent_dir`'s real security check) and a
+clean game relaunch, real gameplay on `lordnikon` (GTA V Enhanced, menu 483fps, an
+opening cinematic 472fps, live driving-around gameplay 487fps) showed **no freeze at
+all** and no capture-side stalling. But `helper_frames` stayed at 0 the entire time --
+the permission fix let `shm.bin` get touched, but the mapping never actually round-
+tripped a frame, so this "clean" result never actually exercised the composition code
+v0.1.33 touched. Before this could be re-verified with the pipeline actually engaged,
+the user reported GTA V Enhanced, GTA San Andreas, *and* Crimson Desert all now
+freezing solid (force-close required) with the layer enabled, recovering when the
+`VKLayer_DLSS5=1` launch option was removed -- a real regression, confirmed across
+multiple, unrelated games, meaning something in the shared layer code, not anything
+game-specific.
+
+**Bug 1, root cause of the permission failure (not just its symptom)**:
+`dlssnr_protocol::mapping::open_at` (`crates/protocol/src/mapping.rs`, used by the CLI
+and GUI -- the ones that actually create `/tmp/dlssnr-$UID/` for the first time each
+boot, typically via `dlssnr-cli start` at login, well before any game touches it) used
+plain `std::fs::create_dir_all(dir)` with no explicit mode -- meaning the resulting
+permissions were `0o777 & !umask`, whatever umask the *first* process to ever create
+the directory that boot happened to have, not necessarily private. `dlssnr_layer`'s own
+`ensure_private_parent_dir` (a real, deliberate security check) then permanently
+refuses to use a directory that isn't private, for the rest of that process's life, and
+has no way to fix it -- so a permissive first-creation silently disabled neural
+rendering for every game launched that boot, with the only visible evidence being a
+`[shm] refusing ...` line in the layer's own log, which nothing sets `DLSSNR_LOG` to
+capture for a real game launch. **Fixed**: `open_at` now explicitly
+`set_permissions(dir, 0o700)` after `create_dir_all`, every call, not just on first
+creation -- immune to umask, and self-heals a directory a previous, buggy build
+already created wrong, no manual `chmod` ever needed again.
+
+**Bug 2, the real freeze, found once the permission fix let the pipeline actually run
+for the first time**: v0.1.33's own `capture_pristine` fix (bounded fence wait +
+non-blocking entry check) was real and correct for *that specific* wait, but it was
+not the only unbounded `wait_for_fences` on the hot path -- it was just the first one
+the pipeline could ever reach, because every game launch before v0.1.34's permission
+fix failed open before capture ever ran for real. `composition::gpu::GpuCompose`'s own
+`dispatch_into_image_async` -- the primary per-frame compose path, not a rare
+fallback -- has an *identical* unbounded entry wait (`wait_for_fences(..., u64::MAX)`,
+waiting on an async slot's own previous dispatch before reusing it), called from
+inside the present hook exactly like `capture_pristine`'s was. Once real frames
+started actually reaching compose (thanks to bug 1's fix), this became the new
+blocking point -- explaining both why v0.1.33 alone still froze on real gameplay, and
+why the earlier permission-bug session never saw it (the pipeline could not get far
+enough to reach this code at all). Same fix, same reasoning, applied to every fence
+wait remaining on any path `capture::run` can reach for a normal frame:
+`GpuCompose::dispatch_into_image_async`'s entry wait, `dispatch_into_image`/
+`dispatch`'s own submission wait (both bounded to the same `ASYNC_SLOT_FENCE_TIMEOUT_NS`,
+8ms), plus a non-blocking entry guard on `self.sync`'s shared fence before either of
+those two functions ever resets or resizes it (the exact same "resetting a command
+buffer whose previous submission hasn't finished is UB" risk `capture_pristine` had,
+just on `self.sync` instead of `CaptureResources`) -- and `write_bytes_to_image`'s own
+last-resort wait (`capture.rs`, bounded to `CAPTURE_FENCE_TIMEOUT_NS`). `run_sync`'s
+two waits (`debug_view`/`capture_request` only, not the path any of this regression is
+in) were deliberately left unbounded, same reasoning as before.
+
+**Not yet re-verified live** -- this was shipped directly to unblock the user rather
+than waiting for another RGL-cooperative relaunch (see the section above for how
+unreliable that's been today). Full test suite and the smoke test are green. If a
+freeze somehow persists after this, the next place to look is *why* a fresh
+submission's own bounded wait isn't completing within 8ms on this hardware at all --
+that would mean the underlying GPU-side cost itself, not any remaining unbounded CPU
+wait, since every fence wait on the real gameplay path is now bounded.
+
 # 2026-09-12 (later the same day): a real UB/hang bug found in `capture_pristine`,
 # fixed -- the ~22x FPS regression's likely root cause, not fully confirmed live
 

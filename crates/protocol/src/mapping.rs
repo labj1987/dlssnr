@@ -54,6 +54,23 @@ pub(crate) fn open_at(path: &str) -> Option<Mapping> {
         let dir = &path[..slash];
         if !dir.is_empty() {
             let _ = std::fs::create_dir_all(dir);
+            // Real bug, found 2026-09-12: `create_dir_all` alone leaves the directory's
+            // mode at `0o777 & !umask` -- whatever the *first* process to ever create it
+            // (typically the CLI/supervisor at login, starting the helper) happened to
+            // have as its own umask, not necessarily private. `dlssnr_layer`'s own
+            // `ensure_private_parent_dir` (a real, deliberate security check --
+            // `crates/layer/src/shm.rs`) refuses to use a mapping whose parent directory
+            // isn't private, and has no way to fix it, only to permanently refuse it for
+            // the rest of that process's life -- so a permissive first-creation silently
+            // disabled every game's neural rendering for the whole session, with no
+            // error visible anywhere except the layer's own log (which nothing sets
+            // `DLSSNR_LOG` to see, for a real game launch). `set_permissions` runs
+            // unconditionally here, every call, not just on first creation, so it also
+            // self-heals a directory a previous, buggy version of this function already
+            // created with the wrong mode -- no manual `chmod` should ever be needed
+            // again. Ignoring the error: a failure here means the layer's own check
+            // will (correctly) refuse the directory anyway.
+            let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
         }
     }
 
