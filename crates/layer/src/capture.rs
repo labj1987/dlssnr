@@ -23,12 +23,6 @@ use ash::vk;
 
 use crate::shm::ShmClient;
 
-/// Generous relative to the "a few milliseconds" 2026-09-10 measurement of this
-/// exact submission (see [`capture_pristine`]'s own doc comment for the regression
-/// this bounds) -- not a tight budget, just a ceiling that keeps a real stall from
-/// costing the game's own present call anywhere near what an unbounded wait did.
-const CAPTURE_FENCE_TIMEOUT_NS: u64 = 8_000_000; // 8ms
-
 pub struct CaptureResources {
     queue_family: u32,
     pool: vk::CommandPool,
@@ -78,19 +72,9 @@ fn ensure(
         if r.queue_family == queue_family && r.capacity >= bytes {
             return true;
         }
-        // A resize (queue family change or `bytes` growth) needs `r`'s own fence
-        // actually signaled before destroying it -- `capture_pristine`'s own entry
-        // check (see its 2026-09-12 doc comment) exists precisely because this is
-        // *not* reliably guaranteed by call order alone on real hardware. Same
-        // fail-open discipline: if a resize is needed but the previous submission
-        // hasn't finished, skip resizing (and therefore capturing) this cycle rather
-        // than destroy possibly-in-flight resources -- there will be a later cycle.
-        // SAFETY: `r.fence` is a real fence this struct owns exclusively.
-        if unsafe { device.get_fence_status(r.fence) } != Ok(true) {
-            return false;
-        }
-        // SAFETY: the fence check above confirms no submission against `r`'s
-        // resources is still in flight.
+        // SAFETY: called between frames, never while `r.fence` might still be
+        // unsignaled from an in-flight submission -- `queue_present_khr` only reaches
+        // here after the previous frame's own capture fully completed.
         unsafe { r.destroy(device) };
         *existing = None;
     }
@@ -505,33 +489,8 @@ fn capture_pristine(
     frame_bytes: u64,
     out: &mut Vec<u8>,
 ) -> bool {
-    // Real bug, found and fixed 2026-09-12 chasing a live ~22x FPS regression
-    // (196-274fps with neural rendering off, 9fps on, GTA V Enhanced on lordnikon,
-    // reproduced twice; GPU utilization *dropped* when the regression hit, ruling out
-    // more real GPU work as the cause) and a `vkcube` test under the same layer that
-    // stalled almost completely after its very first frame -- both point at this
-    // function, not the SHM round trip (the helper's own per-frame cost stayed a
-    // steady 10-23ms throughout) or motion vectors (A/B'd separately, no change).
-    // This used to jump straight to `reset_command_buffer` on `r.cmd`/`r.fence`
-    // unconditionally, on the assumption (`ensure`'s own doc comment states it as a
-    // safety invariant) that the *previous* cycle's submission against them had
-    // already been waited on to completion below. On this real hardware/driver that
-    // wait apparently does not reliably complete anywhere near the "a few
-    // milliseconds" measured on 2026-09-10 -- and resetting a command buffer whose
-    // previous submission has not actually finished is undefined behavior per the
-    // Vulkan spec, not just slow. A non-blocking check here, skipping this cycle
-    // entirely (same fail-open discipline as every other failure path in this
-    // module) rather than resetting possibly-in-flight resources, is what actually
-    // fixes both the observed stall *and* the UB risk the old unconditional reset
-    // already carried, blocking wait or not.
-    // SAFETY: `r.fence` is a real fence this struct owns exclusively.
-    match unsafe { device.get_fence_status(r.fence) } {
-        Ok(true) => {}
-        _ => return false,
-    }
     // SAFETY: `r.cmd` was allocated from `r.pool`, created with
-    // `RESET_COMMAND_BUFFER`; the fence check above confirms no submission against it
-    // is still in flight.
+    // `RESET_COMMAND_BUFFER`.
     if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
         return false;
     }
@@ -616,15 +575,8 @@ fn capture_pristine(
     if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
         return false;
     }
-    // Bounded, not `u64::MAX`: this is `r.fence`'s own fresh submission from just
-    // above, expected to complete in "a few milliseconds" (2026-09-10 measurement),
-    // but the entry check above now means a real stall here fails open exactly like
-    // a `queue_submit` failure already does, instead of blocking `vkQueuePresentKHR`
-    // itself for however long the GPU actually takes -- and safely, since the next
-    // cycle's entry check (above) will see this fence still unsignaled and skip
-    // again rather than reset a command buffer that might still be in flight.
     // SAFETY: `r.fence` was just submitted against above.
-    if unsafe { device.wait_for_fences(&[r.fence], true, CAPTURE_FENCE_TIMEOUT_NS) }.is_err() {
+    if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
         return false;
     }
     // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (the memory
@@ -693,11 +645,7 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
     if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
         return;
     }
-    // Bounded, same reasoning as `CAPTURE_FENCE_TIMEOUT_NS` above -- this is the
-    // last-resort CPU-compose fallback `run()` reaches when the GPU compose paths
-    // above have already failed/timed out; leaving this one wait unbounded would
-    // still let the present hook hang here instead.
-    let _ = unsafe { device.wait_for_fences(&[r.fence], true, CAPTURE_FENCE_TIMEOUT_NS) };
+    let _ = unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) };
 }
 
 /// Captures `image` into the proxy region, runs the shared-memory round trip, and

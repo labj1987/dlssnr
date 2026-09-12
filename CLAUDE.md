@@ -1,3 +1,83 @@
+# 2026-09-12 (later still): v0.1.33/v0.1.34's Vulkan sync changes reverted -- made
+# things worse, not better; handed off. Read this section before touching
+# `capture.rs`/`composition/gpu.rs` fence-wait code again.
+
+**v0.1.34 was deployed and the user tested it live. Result: worse than before, not
+better.** Both GTA games now crash outright on open (not freeze -- an actual crash),
+and Crimson Desert still needs a force-close. This is a regression from v0.1.34's own
+changes, not a confirmation of anything this session believed it had fixed.
+
+**What this session did in response**: reverted `crates/layer/src/capture.rs` and
+`crates/layer/src/composition/gpu.rs` to their exact v0.1.32 state (`git checkout
+bf6f773 -- <those two files>`, confirmed byte-identical to v0.1.31 for both --
+v0.1.32 only touched `gui/src/ui.rs`). This undoes every fence-wait/UB change from the
+two sections below. `crates/protocol/src/mapping.rs`'s permission fix (`set_permissions`
+after `create_dir_all`) was kept -- it never touched Vulkan sync, is low-risk, and
+fixes a real, separately-confirmed bug (see below). Rebuilt, full test suite green,
+smoke test green, deployed to `lordnikon` as v0.1.35. **Not yet re-verified live by
+the user as of this handoff** -- the state a next session inherits.
+
+**Read this as a warning, not just a log entry**: this session's own fence-wait
+"fixes" (bounded `wait_for_fences` + non-blocking `get_fence_status` entry checks, see
+the two sections immediately below) were reasoned through carefully and match this
+project's own established "always fail open" philosophy, backed by real measurements
+(GTA V Enhanced FPS collapse, a `vkcube` near-total stall) -- and they made real
+gameplay *crash* instead of merely running slowly. That gap between "the reasoning
+seemed sound" and "the real-world result was worse" is exactly why:
+1. **No fix in this area should ship again without Vulkan validation layers actually
+   turned on** (`VK_LAYER_KHRONOS_validation`, `VK_INSTANCE_LAYERS` alongside this
+   project's own layer, or `vkconfig`) during real testing -- this session never did
+   this, for any of today's changes, and validation output would very likely have
+   caught a synchronization mistake before it ever reached the user's real games.
+2. A non-blocking `get_fence_status` check immediately before `reset_command_buffer`/
+   resource-destroy, treating anything other than `Ok(true)` as "still in flight, skip
+   this cycle," was this session's core safety argument for why bounding the waits
+   was safe. That argument was never verified against the Vulkan spec's actual
+   guarantees around `vkGetFenceStatus` racing a fence that signals *between* the
+   check and the subsequent `vkResetCommandBuffer`/`vkQueueSubmit`, or against
+   whatever this specific NVIDIA 615.71.09 driver actually does with a reused command
+   pool/fence under contention -- a real, concrete gap in the reasoning, not
+   necessarily *the* bug, but exactly the kind of thing validation layers exist to
+   catch and this session skipped checking.
+3. The two-stage discovery process itself (permission bug masked whether the
+   capture-side fix worked at all; fixing it just exposed a *second* unbounded wait in
+   compose) means there is no confidence the compose-side fix was the last one needed
+   either, even before considering it made things worse. **Assume nothing about this
+   pipeline's real synchronization correctness has been established by this session's
+   own work; assume more coverage gaps exist even in code untouched today.**
+
+**Concretely, for the next session**: the real, unresolved regression is still the
+~22x FPS collapse (196-274fps neural-rendering-off vs. a steady 9fps on) documented
+extensively below, now confirmed real, reproducible, and NOT caused by upstream's
+layer conflict (already fixed) or motion vectors (ruled out via live A/B). The two
+sections below this one contain the full reasoning trail for *why* `capture_pristine`
+and `dispatch_into_image_async` were suspected -- worth reading for context and the
+real measurements they're based on -- but their actual code fixes are reverted and
+should be treated as a *disproven* hypothesis, not a starting point to reapply.
+Suggested next steps, roughly in order of how much they'd de-risk any future attempt:
+1. Get Vulkan validation layers running during a real (or at minimum `vkcube`) test
+   session on `lordnikon` before writing any fix -- this alone might immediately
+   surface the actual bug.
+2. Consider whether the *real* per-frame cost is even a synchronization bug at all,
+   versus genuine GPU/driver-side slowness on this specific hardware (an RTX 5070 on
+   a `615.71.09` driver -- worth checking if that's a beta/early driver with known
+   issues) that no amount of layer-side waiting logic can fix, only work around
+   differently (e.g., lowering `passes`/working resolution, or the still-unmeasured
+   cost of the new optical-flow private device even after being ruled out once via a
+   single A/B toggle -- worth re-confirming, not just trusting that one earlier test).
+3. If attempting the same class of fix again, test it against `vkcube` first (cheap,
+   fast iteration, no Rockstar Games Launcher flakiness) *with validation layers on*,
+   and only move to a real game after `vkcube` shows zero validation errors and a real
+   throughput improvement -- this session went straight to real games both times and
+   paid for it in wasted RGL-relaunch cycles either way.
+4. Full environment/reproduction details, exact file locations, and every command
+   needed to test on `lordnikon` are in this handoff's companion document (ask the
+   user for its path if not already provided, or check the session's own summary to
+   the user for it) -- SSH access, `dlssnr-cli` usage, log locations, and the
+   Rockstar-Games-Launcher-flakiness gotcha (real, separate from this bug, costs
+   significant time if not anticipated) are all there so they don't need
+   re-discovering from scratch.
+
 # 2026-09-12 (later still): two more real bugs found live -- a silent, session-wide
 # permission bug that fully disabled neural rendering, and the v0.1.33 fix's own gap
 

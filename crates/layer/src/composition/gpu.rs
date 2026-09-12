@@ -41,17 +41,6 @@ const SPV: &[u8] = include_bytes!("../../shaders/compose.spv");
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const ASYNC_SLOTS: usize = 2;
 
-/// Bound on [`GpuCompose::dispatch_into_image_async`]'s own entry wait, same reasoning
-/// as `capture.rs`'s `CAPTURE_FENCE_TIMEOUT_NS` (see its doc comment for the regression
-/// this bounds -- the same class of bug, found in the same investigation, once the
-/// capture-side fix let this code path actually run on real hardware for the first
-/// time under a live game session). "By then the GPU has almost always long since
-/// finished, so that wait is normally instant" (this module's own doc comment above)
-/// was the design assumption an unbounded wait was silently depending on to remain
-/// safe from ever blocking `vkQueuePresentKHR` for very long -- generous relative to
-/// that, not a tight budget, just a ceiling.
-const ASYNC_SLOT_FENCE_TIMEOUT_NS: u64 = 8_000_000; // 8ms
-
 #[repr(C)]
 struct PushConstants {
     colour_strength: f32,
@@ -720,22 +709,11 @@ impl GpuCompose {
         max_ratio: f32,
         bgr_order: bool,
     ) -> bool {
-        // Same entry guard as `capture_pristine` (see its 2026-09-12 doc comment) --
-        // `self.sync`'s own previous dispatch may have timed out rather than actually
-        // completed (its own wait is bounded now, not `u64::MAX`), and both resizing
-        // it (`begin_ensured`/`ensure_sized`'s destroy) and resetting its command
-        // buffer are undefined behavior while that submission might still be in
-        // flight. Skip this cycle entirely rather than risk either.
-        // SAFETY: `self.sync.fence` is a real fence this struct owns exclusively.
-        if unsafe { device.get_fence_status(self.sync.fence) } != Ok(true) {
-            return false;
-        }
         // SAFETY: `physical_device` is the device this instance was created against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let Some(frame_bytes) = self.sync.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return false };
 
-        // SAFETY: `self.sync.cmd` was allocated from `RESET_COMMAND_BUFFER`; the fence
-        // check above confirms no submission against it is still in flight.
+        // SAFETY: `self.sync.cmd` was allocated with `RESET_COMMAND_BUFFER`.
         if unsafe { device.reset_command_buffer(self.sync.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
             return false;
         }
@@ -824,20 +802,11 @@ impl GpuCompose {
         bgr_order: bool,
         target_image: vk::Image,
     ) -> bool {
-        // Same entry guard as `dispatch` above and `capture_pristine` (see its
-        // 2026-09-12 doc comment) -- `self.sync` is shared with `dispatch`, and its
-        // own previous submission (from either function) may have timed out rather
-        // than completed.
-        // SAFETY: `self.sync.fence` is a real fence this struct owns exclusively.
-        if unsafe { device.get_fence_status(self.sync.fence) } != Ok(true) {
-            return false;
-        }
         // SAFETY: `physical_device` is the device this instance was created against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let Some(frame_bytes) = self.sync.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return false };
 
-        // SAFETY: `self.sync.cmd` was allocated from `RESET_COMMAND_BUFFER`; the fence
-        // check above confirms no submission against it is still in flight.
+        // SAFETY: `self.sync.cmd` was allocated with `RESET_COMMAND_BUFFER`.
         if unsafe { device.reset_command_buffer(self.sync.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
             return false;
         }
@@ -875,16 +844,8 @@ impl GpuCompose {
         if unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }.is_err() {
             return false;
         }
-        // Bounded, same reasoning as `dispatch_into_image_async`'s own entry wait
-        // (see `ASYNC_SLOT_FENCE_TIMEOUT_NS`'s doc comment) -- this is the fallback
-        // `capture::run` takes when the async path's own entry wait times out, so it
-        // needs the same protection or a real stall just relocates one call down
-        // instead of actually being fixed. A timeout here means `target_image` may not
-        // have received this dispatch's write yet; returning `false` tells the caller
-        // exactly that (same as any other failure this function already reports the
-        // same way) rather than claiming success over incomplete work.
         // SAFETY: `self.sync.fence` was just submitted against above.
-        unsafe { device.wait_for_fences(&[self.sync.fence], true, ASYNC_SLOT_FENCE_TIMEOUT_NS) }.is_ok()
+        unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_ok()
     }
 
     /// The real per-frame fast path: same composition and same write-straight-into-
@@ -946,16 +907,7 @@ impl GpuCompose {
         // block only ever happens `ASYNC_SLOTS` dispatches later, immediately before
         // this specific slot's resources are touched again, never on the frame that
         // just submitted them.
-        //
-        // Bounded, not `u64::MAX` (real bug, found 2026-09-12 chasing a live freeze on
-        // `lordnikon` across multiple real games -- see `ASYNC_SLOT_FENCE_TIMEOUT_NS`'s
-        // own doc comment): a real stall here blocked `vkQueuePresentKHR` itself, since
-        // this function is called from inside the present hook, on whatever thread the
-        // game calls `vkQueuePresentKHR` from. On timeout, returning `None` here is
-        // exactly as safe as any other failure this function already fails open on --
-        // this slot's resources are not touched below, so there's nothing to leave in
-        // a bad state by skipping.
-        if unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, ASYNC_SLOT_FENCE_TIMEOUT_NS) }.is_err() {
+        if unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }.is_err() {
             return None;
         }
 
