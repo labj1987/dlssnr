@@ -82,8 +82,6 @@ fn main() {
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
-    let mut proxy_buf: Vec<u8> = Vec::new();
-    let mut answer_buf: Vec<u8> = Vec::new();
     let mut last_seq_req = hdr.seq_req.load(Ordering::Acquire);
     let mut frames: u64 = 0;
 
@@ -99,9 +97,7 @@ fn main() {
             let proxy_format = hdr.proxy_format.load(Ordering::Relaxed);
             let bytes = (dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) * (width as usize) * (height as usize))
                 .min(dlssnr_protocol::MAX_FRAME);
-            proxy_buf.resize(bytes, 0);
-            answer_buf.resize(bytes, 0);
-            let n = shm.read_proxy(&mut proxy_buf);
+            let n = bytes;
             let mut motion = Vec::new();
             if hdr.frame_mvec_valid.load(Ordering::Relaxed) != 0 {
                 motion.resize((width as usize * height as usize * 4).min(dlssnr_protocol::MAX_FRAME),0);
@@ -142,6 +138,9 @@ fn main() {
                 // displayed forever after the model is permanently unavailable.
                 hdr.helper_state.store(dlssnr_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
             }
+            // SAFETY: this helper exclusively owns the request after observing
+            // `seq_req`; proxy and answer are disjoint fixed regions in the mapping.
+            let (proxy, answer) = unsafe { shm.frame_regions(n) };
             let evaluated = ready
                 && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format)
                 && (|| {
@@ -158,7 +157,7 @@ fn main() {
                     let f = frame_resources.as_ref()?;
                     let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
                     let tuning = hdr.resolve_pass(0);
-                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, &proxy_buf[..n], &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, &mut answer_buf[..n]).then_some(())
+                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer).then_some(())
                 })()
                 .is_some();
             if !evaluated {
@@ -166,9 +165,8 @@ fn main() {
                 // proxy format, or a guarded `EvaluateFeature` failure) -- echo the
                 // proxy straight through so the transport round trip still completes
                 // with *something* rather than stale/all-zero bytes.
-                answer_buf[..n].copy_from_slice(&proxy_buf[..n]);
+                answer.copy_from_slice(proxy);
             }
-            shm.write_answer(&answer_buf[..n]);
             hdr.seq_ok.store(seq_req, Ordering::Relaxed);
             hdr.seq_resp.store(seq_req, Ordering::Release);
             frames += 1;

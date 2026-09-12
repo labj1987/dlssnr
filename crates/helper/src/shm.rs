@@ -224,6 +224,24 @@ impl ShmMapping {
         }
     }
 
+    /// Returns disjoint views of this request's proxy and answer regions.  The helper
+    /// owns each request from observing `seq_req` until publishing `seq_resp`, so it
+    /// can write the answer directly into shared memory instead of copying through a
+    /// second process-local frame buffer.
+    ///
+    /// # Safety
+    /// The caller must only use these views while it owns the current request.
+    pub unsafe fn frame_regions(&self, bytes: usize) -> (&[u8], &mut [u8]) {
+        let n = bytes.min(MAX_FRAME);
+        let base = self.pixel_base();
+        unsafe {
+            (
+                std::slice::from_raw_parts(base.add(proxy_offset()), n),
+                std::slice::from_raw_parts_mut(base.add(answer_offset()), n),
+            )
+        }
+    }
+
     /// # Safety
     /// Must not be called while any other code still holds a reference derived from
     /// `self.header`.
