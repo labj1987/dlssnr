@@ -339,7 +339,10 @@ pub fn build_ui(app: &adw::Application) {
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
                 .build();
-            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)"]);
+            dialog.add_acknowledgement_section(
+                Some("Built with"),
+                &["Claude Code (Anthropic)", "Codex (OpenAI)"],
+            );
             dialog.present(Some(&window));
         });
     }

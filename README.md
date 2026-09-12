@@ -102,3 +102,7 @@ GPL-licensed code was read or ported to build it.
 This project's own code is MIT-licensed — see [LICENSE](LICENSE). It links against and
 depends on NVIDIA's proprietary NGX SDK/DLLs at runtime, which are not covered by that
 license and are not redistributed here.
+
+## Acknowledgements
+
+Development assistance: Claude Code (Anthropic) and Codex (OpenAI).
