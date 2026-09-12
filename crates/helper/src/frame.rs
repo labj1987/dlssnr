@@ -366,21 +366,20 @@ impl FrameResources {
             abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
 
             let t_eval_start = std::time::Instant::now();
-            let (result, seh) = crate::guard::guarded(
-                || {
-                    // SAFETY: `evaluate_feature` was resolved from the live snippet
-                    // module; `feature`/`params` were validated at creation; a null
-                    // command buffer matches this crate's own create-time convention
-                    // (no active command buffer recording -- see `ngx.rs`'s doc
-                    // comment on `create_feature_at`'s identical choice) and a null
-                    // progress callback is always accepted per the NGX contract.
-                    evaluate_feature(vk::CommandBuffer::null(), feature, params, std::ptr::null())
-                },
-                abi::result::FAIL_SEH,
-            );
+            // NGX Vulkan evaluation records its GPU work into a caller-owned, live
+            // command buffer, just as feature creation does. A null buffer can return
+            // success while recording no output work, which leaves Output untouched.
+            let Some(result) = self.run_evaluate(device, queue, || {
+                crate::guard::guarded(
+                    || evaluate_feature(self.cmd, feature, params, std::ptr::null()),
+                    abi::result::FAIL_SEH,
+                )
+            }) else {
+                return false;
+            };
             let t_eval = t_eval_start.elapsed();
-            crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result as u32, seh, t_eval);
-            if !abi::succeeded(result) {
+            crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
+            if !abi::succeeded(result.0) || result.1 != 0 {
                 return false;
             }
             t_eval
@@ -419,6 +418,36 @@ impl FrameResources {
             width: self.width,
             height: self.height,
         }
+    }
+
+    /// Records NGX evaluation into the same queue used for the resource upload and
+    /// download, then waits for completion before Output is copied back to staging.
+    fn run_evaluate<F>(&self, device: &ash::Device, queue: vk::Queue, evaluate: F) -> Option<(abi::NgxResult, u32)>
+    where
+        F: FnOnce() -> (abi::NgxResult, u32),
+    {
+        if unsafe { device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
+            return None;
+        }
+        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if unsafe { device.begin_command_buffer(self.cmd, &begin_info) }.is_err() {
+            return None;
+        }
+        let result = evaluate();
+        if result.1 != 0 || unsafe { device.end_command_buffer(self.cmd) }.is_err() {
+            return None;
+        }
+        if unsafe { device.reset_fences(&[self.fence]) }.is_err() {
+            return None;
+        }
+        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.cmd)).build();
+        if unsafe { device.queue_submit(queue, &[submit], self.fence) }.is_err() {
+            return None;
+        }
+        if unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }.is_err() {
+            return None;
+        }
+        Some(result)
     }
 
     fn run_transfer(&self, device: &ash::Device, queue: vk::Queue, kind: TransferKind) -> bool {

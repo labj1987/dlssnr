@@ -362,41 +362,43 @@ pub unsafe fn run(
         }
     }
 
-    // Capture and send a new frame if (and only if) nothing is currently in flight --
-    // the wire protocol has only ever supported one outstanding request at a time.
-    // Deliberately *before* compositing below: compositing overwrites `image`, and
-    // this capture needs the game's real, unmodified rendering for this frame, not
-    // whatever this same call is about to paint over it.
+    // Capture the current game frame on every present. The helper is asynchronous,
+    // so presenting only when a reply arrives caused visible alternating clean and
+    // enhanced frames. Keeping the latest completed neural result and composing it
+    // over each current pristine frame gives a stable image while the next result is
+    // in flight. This is intentionally a bounded, stale-result approximation: the
+    // helper result is only reused at identical dimensions/format and zero motion is
+    // currently the supported transport mode.
+    if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
+        return None;
+    }
+    let r = resources.as_ref().expect("just ensured above");
+    if !capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
+        return None;
+    }
+
+    if have_answer && inflight.dims == Some((width, height, proxy_format)) {
+        last_answer.clear();
+        last_answer.extend_from_slice(answer_scratch);
+    }
+
+    // Submit the current pristine frame only after preserving it for this present's
+    // composition. `inflight` owns an independent copy because the next present will
+    // overwrite `original_scratch` before this request resolves.
     if !shm.has_pending_request() {
-        if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-            return None;
-        }
-        let r = resources.as_ref().expect("just ensured above");
-        if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
-            shm.set_frame_info(width, height, proxy_format);
-            shm.write_proxy(original_scratch);
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-            if shm.begin_async_request() {
-                std::mem::swap(&mut inflight.original, original_scratch);
-                inflight.dims = Some((width, height, proxy_format));
-            }
+        shm.set_frame_info(width, height, proxy_format);
+        shm.write_proxy(original_scratch);
+        shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+        if shm.begin_async_request() {
+            inflight.original.clear();
+            inflight.original.extend_from_slice(original_scratch);
+            inflight.dims = Some((width, height, proxy_format));
         }
     }
 
-    if !have_answer {
-        return None;
-    }
-    // A resolution (or format) change between when `inflight` was captured and now
-    // means its bytes describe a differently-sized frame -- compositing them against
-    // `image` at today's dimensions would read/write out of step with reality.
-    // Discard rather than risk it; `inflight` gets overwritten by the next successful
-    // capture above regardless.
-    if inflight.dims != Some((width, height, proxy_format)) {
-        return None;
-    }
-    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
-        // `RGBA16F` has no composition path at all yet (see `composition::apply`'s own
-        // doc comment) -- nothing to do with a fresh answer for it here.
+    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format)
+        || last_answer.len() != frame_bytes as usize
+    {
         return None;
     }
 
@@ -411,8 +413,8 @@ pub unsafe fn run(
             queue,
             width,
             height,
-            &inflight.original,
-            answer_scratch,
+            original_scratch,
+            last_answer,
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
@@ -431,8 +433,8 @@ pub unsafe fn run(
             queue,
             width,
             height,
-            &inflight.original,
-            answer_scratch,
+            original_scratch,
+            last_answer,
             settings.colour_strength,
             settings.transfer_strength,
             settings.max_ratio,
@@ -446,8 +448,10 @@ pub unsafe fn run(
     // CPU reference implementation, then a plain buffer-mediated write-back using the
     // same `CaptureResources` staging buffer `capture_pristine` above already ensured
     // exists.
+    answer_scratch.clear();
+    answer_scratch.extend_from_slice(last_answer);
     crate::composition::apply::apply_rgba8(
-        &inflight.original,
+        original_scratch,
         answer_scratch,
         settings.colour_strength,
         settings.transfer_strength,
@@ -455,10 +459,6 @@ pub unsafe fn run(
         0,
         bgr_order,
     );
-    if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-        return None;
-    }
-    let r = resources.as_ref().expect("just ensured above");
     write_bytes_to_image(device, r, queue, image, width, height, answer_scratch);
     None
 }

@@ -115,6 +115,7 @@ struct State {
     /// Reused across frames the same way `original_scratch` is, for the answer bytes
     /// `capture::run` reads back once a round trip resolves.
     answer_scratch: Vec<u8>,
+    last_answer: Vec<u8>,
 }
 
 impl DlssnrDeviceInfo {
@@ -368,7 +369,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
-                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, .. } = &mut *state;
+                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, .. } = &mut *state;
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
@@ -405,6 +406,7 @@ impl DeviceHooks for DlssnrDeviceInfo {
                             original_scratch,
                             inflight,
                             answer_scratch,
+                            last_answer,
                         );
                     }
                 }
