@@ -874,7 +874,11 @@ unsafe fn run_sync(
                         // case still goes through the slower, fully-synchronous
                         // CPU-visible `dispatch` below, same as before this path
                         // existed.
-                        if !shm.capture_request_pending() {
+                        // The first neural frame after enabling the feature can
+                        // race the application's present transition on NVIDIA
+                        // drivers. Keep composition CPU-visible until the
+                        // async handoff is proven safe for live games.
+                        if false && !shm.capture_request_pending() {
                             if let Some(gpu) = gpu_compose {
                                 composed_async = gpu.dispatch_into_image_async(
                                     device,
