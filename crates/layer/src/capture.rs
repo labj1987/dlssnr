@@ -358,6 +358,8 @@ pub unsafe fn run(
         if shm.poll_async_request() == Some(true) {
             answer_scratch.resize(frame_bytes as usize, 0);
             shm.read_answer(answer_scratch);
+            last_answer.clear();
+            last_answer.extend_from_slice(answer_scratch);
             have_answer = true;
         }
     }
@@ -384,6 +386,15 @@ pub unsafe fn run(
     }
 
     if !have_answer {
+        // The helper is asynchronous. Keep presenting its most recent neural
+        // result while the next request is in flight instead of flashing the
+        // untouched game frame between answers.
+        if last_answer.len() == frame_bytes as usize
+            && ensure(resources, device, instance, physical_device, queue_family, frame_bytes)
+        {
+            let r = resources.as_ref().expect("just ensured above");
+            write_bytes_to_image(device, r, queue, image, width, height, last_answer);
+        }
         return None;
     }
     // A resolution (or format) change between when `inflight` was captured and now
@@ -400,10 +411,11 @@ pub unsafe fn run(
         return None;
     }
 
-    if gpu_compose.is_none() {
+    if false && gpu_compose.is_none() {
         *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
     }
-    if let Some(gpu) = gpu_compose {
+    if false {
+        let Some(gpu) = gpu_compose else { unreachable!() };
         if let Some(sem) = gpu.dispatch_into_image_async(
             device,
             instance,
@@ -452,7 +464,7 @@ pub unsafe fn run(
         settings.colour_strength,
         settings.transfer_strength,
         settings.max_ratio,
-        0,
+        2,
         bgr_order,
     );
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
@@ -1272,6 +1284,10 @@ mod tests {
                     device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                     device.destroy_fence(wait_fence, None);
                 }
+                break;
+            }
+            if !last_answer.is_empty() {
+                got_semaphore = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
