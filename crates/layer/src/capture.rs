@@ -854,7 +854,7 @@ unsafe fn run_sync(
         // `dlssnr_protocol::enums::proxy_format` for the format codes).
         if dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
             if let Some(settings) = shm.composition_settings() {
-                if settings.apply_model {
+                if settings.apply_model && settings.neural_enabled {
                     // GPU dispatch (`composition::gpu`) only implements the normal
                     // composited case (`compose.comp` has no concept of `debug_view`
                     // at all) -- fails open to the CPU reference
