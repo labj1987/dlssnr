@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-cli"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-gui"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "dlssnr-protocol",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-helper"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "ash",
  "dlssnr-protocol",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-layer"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "ash",
  "dlssnr-protocol",
@@ -145,14 +145,14 @@ dependencies = [
 
 [[package]]
 name = "dlssnr-protocol"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dlssnr-supervisor"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "dlssnr-protocol",
  "libc",
