@@ -227,6 +227,13 @@ impl ShmClient {
 
     pub fn prepare_motion(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
         width: u32, height: u32, format: u32, bytes: &[u8]) {
+        // The experimental optical-flow implementation creates a private
+        // Vulkan device from inside the present hook. NVIDIA drivers can crash
+        // during that device creation, so keep this path disabled until its
+        // device lifecycle is made safe. Capture and composition still work.
+        let _ = (instance, pd, width, height, format, bytes);
+        return;
+        #[allow(unreachable_code)]
         let Some(h) = self.header() else { return };
         h.frame_mvec_valid.store(0, Ordering::Relaxed);
         let enabled = h.mvec_enabled() && dlssnr_protocol::enums::proxy_format::is_8bit(format);
