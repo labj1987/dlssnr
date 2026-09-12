@@ -49,6 +49,7 @@ struct PushConstants {
     /// Matches `compose.comp`'s own `params.bgr_order` field exactly (same offset,
     /// same 4-byte size as the `f32`s above it -- no padding to worry about).
     bgr_order: u32,
+    carry_delta: u32,
 }
 
 struct Image {
@@ -193,6 +194,9 @@ struct Sized_ {
     height: u32,
     original: Image,
     model_answer: Image,
+    // The game frame that produced `model_answer`; used to carry its enhancement
+    // delta onto newer game frames.
+    proxy: Image,
     output: Image,
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
@@ -202,6 +206,8 @@ struct Sized_ {
     // held answer must not re-upload 4K pixels from the CPU every swapchain present.
     cached_buffer: vk::Buffer,
     cached_memory: vk::DeviceMemory,
+    current_buffer: vk::Buffer,
+    current_memory: vk::DeviceMemory,
 }
 
 /// One independent, fully self-contained resource set: its own images/staging buffer
@@ -246,11 +252,14 @@ impl ComposeSlot {
             unsafe {
                 s.original.destroy(device);
                 s.model_answer.destroy(device);
+                s.proxy.destroy(device);
                 s.output.destroy(device);
                 device.destroy_buffer(s.staging_buffer, None);
                 device.free_memory(s.staging_memory, None);
                 device.destroy_buffer(s.cached_buffer, None);
                 device.free_memory(s.cached_memory, None);
+                device.destroy_buffer(s.current_buffer, None);
+                device.free_memory(s.current_memory, None);
             }
             self.sized = None;
             self.cached_generation = 0;
@@ -258,7 +267,8 @@ impl ComposeSlot {
 
         let usage_in = vk::ImageUsageFlags::TRANSFER_DST;
         let usage_out = vk::ImageUsageFlags::TRANSFER_SRC;
-        let (Some(original), Some(model_answer), Some(output)) = (
+        let (Some(original), Some(model_answer), Some(proxy), Some(output)) = (
+            create_storage_image(device, mem_props, width, height, usage_in),
             create_storage_image(device, mem_props, width, height, usage_in),
             create_storage_image(device, mem_props, width, height, usage_in),
             create_storage_image(device, mem_props, width, height, usage_out),
@@ -324,6 +334,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 original.destroy(device);
                 model_answer.destroy(device);
+                proxy.destroy(device);
                 output.destroy(device);
             }
             return false;
@@ -338,6 +349,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 original.destroy(device);
                 model_answer.destroy(device);
+                proxy.destroy(device);
                 output.destroy(device);
             }
             return false;
@@ -350,6 +362,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 original.destroy(device);
                 model_answer.destroy(device);
+                proxy.destroy(device);
                 output.destroy(device);
             }
             return false;
@@ -362,13 +375,26 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 original.destroy(device);
                 model_answer.destroy(device);
+                proxy.destroy(device);
                 output.destroy(device);
             }
             return false;
         }
 
+        let current_info = vk::BufferCreateInfo::builder()
+            .size(frame_bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let Ok(current_buffer) = (unsafe { device.create_buffer(&current_info, None) }) else { return false };
+        let current_reqs = unsafe { device.get_buffer_memory_requirements(current_buffer) };
+        let Some(current_type) = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
+        let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
+        let Ok(current_memory) = (unsafe { device.allocate_memory(&current_alloc, None) }) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
+        if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() { unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) }; return false; }
+
         let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
-        let infos = [image_info(original.view), image_info(original.view), image_info(model_answer.view), image_info(output.view)];
+        let infos = [image_info(original.view), image_info(proxy.view), image_info(model_answer.view), image_info(output.view)];
         let writes: Vec<_> = (0..4u32)
             .map(|i| {
                 vk::WriteDescriptorSet::builder()
@@ -384,7 +410,7 @@ impl ComposeSlot {
         // least as long as `self.sized` holds its owning `Image`.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        self.sized = Some(Sized_ { width, height, original, model_answer, output, staging_buffer, staging_memory, staging_ptr: staging_ptr.cast(), staging_capacity, cached_buffer, cached_memory });
+        self.sized = Some(Sized_ { width, height, original, model_answer, proxy, output, staging_buffer, staging_memory, staging_ptr: staging_ptr.cast(), staging_capacity, cached_buffer, cached_memory, current_buffer, current_memory });
         true
     }
 
@@ -431,21 +457,24 @@ impl ComposeSlot {
             let to_dst = [
                 image_barrier(s.original.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
                 image_barrier(s.model_answer.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
+                image_barrier(s.proxy.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
             ];
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
             device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(0)]);
             device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(frame_bytes)]);
+            device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(0)]);
 
             let to_general = [
                 image_barrier(s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
                 image_barrier(s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
                 image_barrier(s.output.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::SHADER_WRITE),
             ];
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_general);
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, carry_delta: 0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -550,6 +579,63 @@ impl ComposeSlot {
         }
     }
 
+    /// Records a lightweight temporal carry pass.  It reads the current swapchain
+    /// image into device-local storage, applies the cached model delta, then writes
+    /// the result back; no per-frame CPU readback or upload is involved.
+    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, frame_bytes: u64, update_cache: bool, bgr_order: bool, target_image: vk::Image) {
+        let s = self.sized.as_ref().expect("caller already ensured this");
+        let cached_before = self.cached_generation != 0;
+        unsafe {
+            let target_to_src = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_src]);
+            device.cmd_copy_image_to_buffer(self.cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.current_buffer, &[image_copy_region(width, height, 0)]);
+            let current_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes).build();
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[current_ready], &[]);
+
+            if update_cache {
+                let old = if cached_before { vk::ImageLayout::GENERAL } else { vk::ImageLayout::UNDEFINED };
+                let to_dst = [
+                    image_barrier(s.proxy.image, old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                    image_barrier(s.model_answer.image, old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                ];
+                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
+                device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+                device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, frame_bytes)]);
+                let to_general = [
+                    image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                    image_barrier(s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
+                ];
+                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_general);
+            }
+            let current_old = if cached_before { vk::ImageLayout::GENERAL } else { vk::ImageLayout::UNDEFINED };
+            let output_old = if cached_before { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { vk::ImageLayout::UNDEFINED };
+            let to_compute = [
+                image_barrier(s.original.image, current_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
+                image_barrier(s.output.image, output_old, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_WRITE),
+            ];
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_compute);
+            device.cmd_copy_buffer_to_image(self.cmd, s.current_buffer, s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let original_general = image_barrier(s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ);
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[original_general]);
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
+            let push = PushConstants { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, bgr_order: bgr_order as u32, carry_delta: 1 };
+            let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
+            device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+            device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            let output_src = image_barrier(s.output.image, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::TRANSFER_READ);
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[output_src]);
+            device.cmd_copy_image_to_buffer(self.cmd, s.output.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.cached_buffer, &[image_copy_region(width, height, 0)]);
+            let output_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.cached_buffer).offset(0).size(frame_bytes).build();
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[output_ready], &[]);
+            let target_to_dst = image_barrier(target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_dst]);
+            device.cmd_copy_buffer_to_image(self.cmd, s.cached_buffer, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let to_present = image_barrier(target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+        }
+    }
+
     /// # Safety
     /// No GPU work referencing this slot's handles may still be in flight.
     unsafe fn destroy(&self, device: &ash::Device) {
@@ -558,11 +644,14 @@ impl ComposeSlot {
             if let Some(s) = &self.sized {
                 s.original.destroy(device);
                 s.model_answer.destroy(device);
+                s.proxy.destroy(device);
                 s.output.destroy(device);
                 device.destroy_buffer(s.staging_buffer, None);
                 device.free_memory(s.staging_memory, None);
                 device.destroy_buffer(s.cached_buffer, None);
                 device.free_memory(s.cached_memory, None);
+                device.destroy_buffer(s.current_buffer, None);
+                device.free_memory(s.current_memory, None);
             }
             device.destroy_fence(self.fence, None);
         }
@@ -947,6 +1036,33 @@ impl GpuCompose {
         }
         // SAFETY: `self.sync.fence` was just submitted against above.
         unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_ok()
+    }
+
+    pub fn present_temporal_delta_async(
+        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
+        width: u32, height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image,
+    ) -> Option<vk::Semaphore> {
+        let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
+        let slot = &mut self.async_slots[idx];
+        if unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }.is_err() { return None; }
+        let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
+        if generation == 0 || base.len() < bytes || answer.len() < bytes { return None; }
+        let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+        let update = slot.slot.cached_generation != generation;
+        if update {
+            let s = slot.slot.sized.as_ref().expect("ensured");
+            unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), s.staging_ptr, bytes); std::ptr::copy_nonoverlapping(answer.as_ptr(), s.staging_ptr.add(bytes), bytes); }
+        }
+        if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
+        let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
+        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, bytes as u64, update, bgr_order, target_image); }
+        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
+        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&slot.semaphore)).build();
+        if unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }.is_err() { return None; }
+        if update { slot.slot.cached_generation = generation; }
+        Some(slot.semaphore)
     }
 
     /// Presents a raw helper answer every frame while uploading it only when the

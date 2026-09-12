@@ -55,6 +55,9 @@ layout(push_constant) uniform Params {
   // every composited frame -- see `swapchain::is_bgr_order`'s doc comment (Rust
   // side) for the full story.
   uint bgr_order;
+  // Carry the model's enhancement delta from its source frame onto the current
+  // frame, preserving camera motion while the helper evaluates the next answer.
+  uint carry_delta;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -195,6 +198,12 @@ void main() {
   vec3 original = SrgbDecode(bgr ? imageLoad(u_original, pixel).bgr : imageLoad(u_original, pixel).rgb);
   vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, pixel).bgr : imageLoad(u_proxy, pixel).rgb);
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
+
+  if (params.carry_delta != 0u) {
+    vec3 encoded = SrgbEncode(clamp(original + (model - proxy), 0.0, 1.0));
+    imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, 1.0));
+    return;
+  }
 
   vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
   // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a

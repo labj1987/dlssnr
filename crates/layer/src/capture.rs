@@ -235,6 +235,7 @@ pub struct Inflight {
     /// Monotonic identity for the held raw helper result.  GPU slots use this to
     /// upload only when a newly evaluated answer arrives.
     raw_answer_generation: u64,
+    raw_answer_base: Vec<u8>,
 }
 
 /// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
@@ -394,6 +395,11 @@ pub unsafe fn run(
         if shm.poll_async_request() == Some(true) {
             answer_scratch.resize(frame_bytes as usize, 0);
             shm.read_answer(answer_scratch);
+            // Preserve the exact game frame supplied to the model before the next
+            // request replaces `inflight.original`; the temporal GPU path uses it
+            // to carry only the model's enhancement delta onto current frames.
+            inflight.raw_answer_base.clear();
+            inflight.raw_answer_base.extend_from_slice(&inflight.original);
             have_answer = true;
         }
     }
@@ -465,15 +471,17 @@ pub unsafe fn run(
         *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
     }
     if let Some(gpu) = gpu_compose {
-        if let Some(sem) = gpu.present_cached_raw_async(
+        if let Some(sem) = gpu.present_temporal_delta_async(
             device,
             instance,
             physical_device,
             queue,
             width,
             height,
+            &inflight.raw_answer_base,
             last_answer,
             inflight.raw_answer_generation,
+            bgr_order,
             image,
         ) {
             return Some(sem);
