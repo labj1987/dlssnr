@@ -31,9 +31,44 @@
   SHM-v2 code. Fix: uninstalled the upstream apt package on `lordnikon`
   (`sudo apt remove dlssnr`) rather than renaming this project's trigger env vars,
   since the whole point of sharing them is drop-in compatibility with a machine that
-  isn't also running upstream. **Not yet done**: a live game re-test after the
-  uninstall — this was found before that could happen; the freeze/crash may or may not
-  have other causes underneath it once this conflict is removed.
+  isn't also running upstream.
+- **Live re-test after the uninstall, and a second, separate, real bug found**: with
+  the conflict gone, launched GTA V Enhanced (already had `VKLayer_DLSS5=1
+  %command%` in its own Steam launch options from an earlier session) for real via
+  the actual running Steam client on `lordnikon`'s live desktop, with
+  `dlssnr_helper` started through `dlssnr-cli start` first. **No freeze, no crash**
+  — the game loaded past the legal splash straight into a resumed save, real
+  rendering the whole way, and for the first time this project's own testing has
+  ever seen, `NVSDK_NGX_VULKAN_EvaluateFeature` **succeeded repeatedly against real
+  gameplay frames** (`-> 0x1`, not `0xbad0000b`/`0xbad00002`), each one logged with
+  real timing (`upload`/`eval`/`download`, totalling roughly 10-23ms — well inside
+  a 60fps budget on its own). But real, displayed FPS with neural rendering on was
+  **9**, against **196-274 with it off** (`dlssnr-cli shmctl toggle enabled`,
+  A/B'd twice, both directions reproduced instantly and consistently) — GPU
+  utilization *dropped* with it on (21-26% enabled vs. 99% disabled), meaning this
+  isn't the GPU doing more real work, something is stalling. Separately toggled
+  `mvec_enabled` off (leaving `enabled=1`) to test the new optical-flow path
+  specifically as a suspect, given the release notes' own "FPS impact ... has not
+  been measured" caveat — **no change, still 9fps** — so this is not the optical
+  flow work, and whatever it is predates v0.1.31. The ~22x frame-rate collapse is
+  the strongest real candidate yet for what "games freeze or crash" actually was:
+  not a hang or a crash in the literal sense, but a drop severe enough (9fps) to
+  read as one. Left the running session with `enabled=0` (full FPS restored) rather
+  than the persisted default, so the game stays playable; `dlssnr-cli shmctl toggle
+  enabled` flips it back for further diagnosis.
+  **Not yet done, and the obvious next step**: find where the stall actually is.
+  The helper's own per-frame cost (10-23ms) doesn't explain a 9fps result (~111ms/
+  frame) — the gap has to be on the *layer* side: capture, the SHM round-trip wait,
+  or write-back. `capture.rs`'s async cross-frame pipelining (see the
+  "Cross-frame async pipelining" section below) was specifically built to avoid a
+  synchronous per-frame stall; whether it's actually the path being taken in this
+  real game (vs. falling back to the synchronous path for some real-game-specific
+  reason `vkcube` never exercised) hasn't been checked. `DLSSNR_LOG` wasn't set for
+  this real launch (only `smoke-test.sh` sets it explicitly), so the layer's own
+  log went to stderr, into whatever Steam/Proton did with it — capturing that
+  directly (set `DLSSNR_LOG` in the game's own Steam launch options alongside
+  `VKLayer_DLSS5=1`) is the fastest way to see which path a real frame is actually
+  taking.
 
 # 2026-09-11 follow-up implementation (unreleased)
 
