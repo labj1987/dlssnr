@@ -25,5 +25,14 @@ fn main() {
         ui::build_ui(app);
     });
 
+    // The helper is launched as a detached Proton/Wine process tree. Shut it
+    // down when the GUI exits so AppImage launchers such as Gear Lever do not
+    // keep reporting the application as still running.
+    app.connect_shutdown(|_| {
+        if dlssnr_supervisor::is_running().is_some() {
+            let _ = dlssnr_supervisor::stop(std::time::Duration::from_secs(5));
+        }
+    });
+
     std::process::exit(app.run().get() as i32);
 }
