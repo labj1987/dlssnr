@@ -232,6 +232,9 @@ pub struct Inflight {
     /// a result to the swapchain, so starting the game with NR off stays visually
     /// and functionally off.
     bootstrap_complete: bool,
+    /// Monotonic identity for the held raw helper result.  GPU slots use this to
+    /// upload only when a newly evaluated answer arrives.
+    raw_answer_generation: u64,
 }
 
 /// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
@@ -416,85 +419,74 @@ pub unsafe fn run(
         }
     }
 
-    if !have_answer {
-        return None;
-    }
-    // A resolution (or format) change between when `inflight` was captured and now
-    // means its bytes describe a differently-sized frame -- compositing them against
-    // `image` at today's dimensions would read/write out of step with reality.
-    // Discard rather than risk it; `inflight` gets overwritten by the next successful
-    // capture above regardless.
-    if inflight.dims != Some((width, height, proxy_format)) {
-        return None;
-    }
-    if !dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
-        // `RGBA16F` has no composition path at all yet (see `composition::apply`'s own
-        // doc comment) -- nothing to do with a fresh answer for it here.
-        return None;
+    if have_answer && inflight.dims == Some((width, height, proxy_format)) && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        // Retain the model's raw answer for continuous re-presentation below --
+        // deliberately *not* run through `composition::gpu`/`composition::apply`'s
+        // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
+        // own luminance exactly whenever `original <= proxy`; this pipeline's `proxy
+        // == original` (no real downscaled proxy exists yet -- see this crate's other
+        // doc comments) makes that true on every pixel, which doesn't just dilute the
+        // model's edit but actively fights it: a *stronger* raw answer gets *more*
+        // aggressively cancelled by the same ratio-based rescale, confirmed by direct
+        // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
+        // doubled the raw model's own delta from original, then the compositor's
+        // output delta *dropped* below the unmodified baseline). No tuning knob fixes
+        // that; it's this pipeline's proxy/original conflation actively working
+        // against the model's answer, not merely muting it.
+        last_answer.clear();
+        last_answer.extend_from_slice(answer_scratch);
+        inflight.raw_answer_generation = inflight.raw_answer_generation.wrapping_add(1).max(1);
     }
 
+    // Re-present the most recently retained answer on *every* call, not only the
+    // rare one a round trip happens to resolve on. Compositing only on that rare
+    // frame (`image` left completely untouched every other frame, this function's
+    // very first design) alternates "native" and "one processed frame" -- the
+    // flicker this project has fought since v0.1.49/v0.1.50 (see this crate's other
+    // doc comments) -- independently of whether that processed frame is stale.
+    // Re-blitting the same held answer every frame instead removes the alternation:
+    // displayed content is always "the model's edit," refreshed at the round trip's
+    // own cadence rather than toggling against untouched frames in between. This
+    // does not fix temporal staleness during fast motion (the tradeoff a real
+    // downscaled-proxy-plus-motion-vector pipeline would remove) -- see this
+    // crate's own doc comment on motion vectors being disabled -- but it removes
+    // the *alternation* specifically, a separate and, per tonight's live testing,
+    // apparently the dominant source of what got called "flicker".
+    if last_answer.is_empty() {
+        return None;
+    }
+    // Cache each helper answer in device-local memory once, then copy that cached
+    // frame to every presented swapchain image.  The prior path re-uploaded two 4K
+    // CPU buffers and ran the compose shader on every present, which made the counter
+    // read in the 50s while frame pacing felt like the teens.  This leaves only one
+    // device-local transfer on ordinary presents and preserves the no-flicker held
+    // answer policy.
     if gpu_compose.is_none() {
         *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
     }
     if let Some(gpu) = gpu_compose {
-        if let Some(sem) = gpu.dispatch_into_image_async(
+        if let Some(sem) = gpu.present_cached_raw_async(
             device,
             instance,
             physical_device,
             queue,
             width,
             height,
-            &inflight.original,
-            answer_scratch,
-            settings.colour_strength,
-            settings.transfer_strength,
-            settings.max_ratio,
-            bgr_order,
+            last_answer,
+            inflight.raw_answer_generation,
             image,
         ) {
             return Some(sem);
         }
-        // Async slot busy or failed -- fall back to the same dispatch, synchronously,
-        // still cheaper and simpler than standing up a whole second (buffer-mediated,
-        // CPU-visible) write-back path for what should be a rare case.
-        if gpu.dispatch_into_image(
-            device,
-            instance,
-            physical_device,
-            queue,
-            width,
-            height,
-            &inflight.original,
-            answer_scratch,
-            settings.colour_strength,
-            settings.transfer_strength,
-            settings.max_ratio,
-            bgr_order,
-            image,
-        ) {
-            return None;
-        }
     }
     // No GPU compose available at all (`GpuCompose::new` failed) -- last resort: the
-    // CPU reference implementation, then a plain buffer-mediated write-back using the
-    // same `CaptureResources` staging buffer `capture_pristine` above already ensured
-    // exists.
-    answer_scratch.clear();
-    answer_scratch.extend_from_slice(last_answer);
-    crate::composition::apply::apply_rgba8(
-        &inflight.original,
-        answer_scratch,
-        settings.colour_strength,
-        settings.transfer_strength,
-        settings.max_ratio,
-        0,
-        bgr_order,
-    );
+    // same CPU-visible write-back every other fallback path in this module already
+    // uses, blocking cost and all.
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
         return None;
     }
     let r = resources.as_ref().expect("just ensured above");
-    write_bytes_to_image(device, r, queue, image, width, height, answer_scratch);
+    write_bytes_to_image(device, r, queue, image, width, height, last_answer);
     None
 }
 

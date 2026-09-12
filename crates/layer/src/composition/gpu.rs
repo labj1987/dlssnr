@@ -198,6 +198,10 @@ struct Sized_ {
     staging_memory: vk::DeviceMemory,
     staging_ptr: *mut u8,
     staging_capacity: vk::DeviceSize,
+    // A device-local copy of the most recent raw model frame.  Re-presenting a
+    // held answer must not re-upload 4K pixels from the CPU every swapchain present.
+    cached_buffer: vk::Buffer,
+    cached_memory: vk::DeviceMemory,
 }
 
 /// One independent, fully self-contained resource set: its own images/staging buffer
@@ -209,6 +213,7 @@ struct ComposeSlot {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     sized: Option<Sized_>,
+    cached_generation: u64,
 }
 
 impl ComposeSlot {
@@ -224,7 +229,7 @@ impl ComposeSlot {
         // SAFETY: starting signaled means this slot's first real use never blocks on a
         // fence nothing has submitted work against yet.
         let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else { return None };
-        Some(Self { descriptor_set, cmd, fence, sized: None })
+        Some(Self { descriptor_set, cmd, fence, sized: None, cached_generation: 0 })
     }
 
     /// (Re)builds this slot's own images/staging buffer if `width`/`height` changed
@@ -244,8 +249,11 @@ impl ComposeSlot {
                 s.output.destroy(device);
                 device.destroy_buffer(s.staging_buffer, None);
                 device.free_memory(s.staging_memory, None);
+                device.destroy_buffer(s.cached_buffer, None);
+                device.free_memory(s.cached_memory, None);
             }
             self.sized = None;
+            self.cached_generation = 0;
         }
 
         let usage_in = vk::ImageUsageFlags::TRANSFER_DST;
@@ -303,6 +311,62 @@ impl ComposeSlot {
             return false;
         };
 
+        // Keep the held raw model frame in device-local memory.  The staging buffer
+        // stays CPU-visible only for the infrequent helper-answer update; regular
+        // presents copy this cached buffer straight to the swapchain image.
+        let cache_info = vk::BufferCreateInfo::builder()
+            .size(frame_bytes)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let Ok(cached_buffer) = (unsafe { device.create_buffer(&cache_info, None) }) else {
+            unsafe {
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        };
+        let cached_reqs = unsafe { device.get_buffer_memory_requirements(cached_buffer) };
+        let Some(cached_type) = find_memory_type(mem_props, cached_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .or_else(|| find_memory_type(mem_props, cached_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+        else {
+            unsafe {
+                device.destroy_buffer(cached_buffer, None);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        };
+        let cached_alloc = vk::MemoryAllocateInfo::builder().allocation_size(cached_reqs.size).memory_type_index(cached_type);
+        let Ok(cached_memory) = (unsafe { device.allocate_memory(&cached_alloc, None) }) else {
+            unsafe {
+                device.destroy_buffer(cached_buffer, None);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        };
+        if unsafe { device.bind_buffer_memory(cached_buffer, cached_memory, 0) }.is_err() {
+            unsafe {
+                device.free_memory(cached_memory, None);
+                device.destroy_buffer(cached_buffer, None);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        }
+
         let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
         let infos = [image_info(original.view), image_info(original.view), image_info(model_answer.view), image_info(output.view)];
         let writes: Vec<_> = (0..4u32)
@@ -320,7 +384,7 @@ impl ComposeSlot {
         // least as long as `self.sized` holds its owning `Image`.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        self.sized = Some(Sized_ { width, height, original, model_answer, output, staging_buffer, staging_memory, staging_ptr: staging_ptr.cast(), staging_capacity });
+        self.sized = Some(Sized_ { width, height, original, model_answer, output, staging_buffer, staging_memory, staging_ptr: staging_ptr.cast(), staging_capacity, cached_buffer, cached_memory });
         true
     }
 
@@ -451,6 +515,41 @@ impl ComposeSlot {
         }
     }
 
+    /// Records a raw held-answer update (only when `update` is true) followed by a
+    /// device-local buffer-to-swapchain copy.  This is deliberately shader-free: the
+    /// helper answer is already encoded in the swapchain's byte order, and copying
+    /// through a buffer preserves those bytes without assuming the target format.
+    ///
+    /// # Safety
+    /// `self.cmd` is recording and `target_image` is currently `PRESENT_SRC_KHR`.
+    unsafe fn record_cached_raw_into_image(&self, device: &ash::Device, width: u32, height: u32, frame_bytes: u64, update: bool, target_image: vk::Image) {
+        let s = self.sized.as_ref().expect("caller already ensured this");
+        unsafe {
+            if update {
+                let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
+                device.cmd_copy_buffer(self.cmd, s.staging_buffer, s.cached_buffer, &[copy]);
+            }
+            // This also covers reads in a later queue submission: queue order alone
+            // orders execution, while this memory dependency makes the cached write
+            // visible to its next transfer read.
+            let ready = vk::BufferMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(s.cached_buffer)
+                .offset(0)
+                .size(frame_bytes)
+                .build();
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[ready], &[]);
+            let to_transfer_dst = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_transfer_dst]);
+            device.cmd_copy_buffer_to_image(self.cmd, s.cached_buffer, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let to_present = image_barrier(target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+        }
+    }
+
     /// # Safety
     /// No GPU work referencing this slot's handles may still be in flight.
     unsafe fn destroy(&self, device: &ash::Device) {
@@ -462,6 +561,8 @@ impl ComposeSlot {
                 s.output.destroy(device);
                 device.destroy_buffer(s.staging_buffer, None);
                 device.free_memory(s.staging_memory, None);
+                device.destroy_buffer(s.cached_buffer, None);
+                device.free_memory(s.cached_memory, None);
             }
             device.destroy_fence(self.fence, None);
         }
@@ -846,6 +947,57 @@ impl GpuCompose {
         }
         // SAFETY: `self.sync.fence` was just submitted against above.
         unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_ok()
+    }
+
+    /// Presents a raw helper answer every frame while uploading it only when the
+    /// helper produces a newer generation.  The normal compose path remains for
+    /// callers that need its math; this path is for the held-answer presentation
+    /// policy in `capture::run`.
+    pub fn present_cached_raw_async(
+        &mut self,
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        raw_answer: &[u8],
+        generation: u64,
+        target_image: vk::Image,
+    ) -> Option<vk::Semaphore> {
+        let idx = self.next_async_slot;
+        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
+        let async_slot = &mut self.async_slots[idx];
+        if unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }.is_err() {
+            return None;
+        }
+        let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
+        if raw_answer.len() < frame_bytes || generation == 0 {
+            return None;
+        }
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        if !async_slot.slot.ensure_sized(device, &mem_props, width, height) {
+            return None;
+        }
+        let update = async_slot.slot.cached_generation != generation;
+        if update {
+            let s = async_slot.slot.sized.as_ref().expect("just ensured above");
+            if s.staging_capacity < frame_bytes as u64 { return None; }
+            unsafe { std::ptr::copy_nonoverlapping(raw_answer.as_ptr(), s.staging_ptr, frame_bytes); }
+            async_slot.slot.cached_generation = generation;
+        }
+        if unsafe { device.reset_command_buffer(async_slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
+        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() { return None; }
+        unsafe { async_slot.slot.record_cached_raw_into_image(device, width, height, frame_bytes as u64, update, target_image); }
+        if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() { return None; }
+        if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() { return None; }
+        let submit = vk::SubmitInfo::builder()
+            .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
+            .signal_semaphores(std::slice::from_ref(&async_slot.semaphore))
+            .build();
+        if unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }.is_err() { return None; }
+        Some(async_slot.semaphore)
     }
 
     /// The real per-frame fast path: same composition and same write-straight-into-
@@ -1339,6 +1491,47 @@ mod tests {
         // SAFETY: `read_back_image`'s own fence wait guarantees no GPU work is in flight.
         unsafe {
             target.destroy(&device);
+            device.destroy_command_pool(pool, None);
+            gpu.destroy(&device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn cached_raw_present_preserves_bytes_and_reuses_the_device_cache() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("cached_raw_present_preserves_bytes_and_reuses_the_device_cache: no Vulkan loader/ICD in this environment, skipping");
+            return;
+        };
+        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
+            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            return;
+        };
+        let (width, height) = (8u32, 8u32);
+        let raw: Vec<u8> = (0..(width * height) as usize).flat_map(|i| {
+            let t = (i * 47 % 256) as u8;
+            [t.wrapping_add(200), t, t.wrapping_add(70), 255]
+        }).collect();
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let targets = [make_target_image(&device, &mem_props, width, height), make_target_image(&device, &mem_props, width, height)];
+        for target in &targets { transition_to_present_src(&device, queue, pool, target.image); }
+        for target in &targets {
+            let sem = gpu.present_cached_raw_async(&device, &instance, physical_device, queue, width, height, &raw, 1, target.image).expect("cached raw present failed");
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build();
+            unsafe {
+                device.queue_submit(queue, &[submit], fence).unwrap();
+                device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+                device.destroy_fence(fence, None);
+            }
+            assert_eq!(read_back_image(&device, &mem_props, queue, pool, target.image, width, height), raw);
+        }
+        unsafe {
+            for target in &targets { target.destroy(&device); }
             device.destroy_command_pool(pool, None);
             gpu.destroy(&device);
             device.destroy_device(None);
