@@ -358,8 +358,6 @@ pub unsafe fn run(
         if shm.poll_async_request() == Some(true) {
             answer_scratch.resize(frame_bytes as usize, 0);
             shm.read_answer(answer_scratch);
-            last_answer.clear();
-            last_answer.extend_from_slice(answer_scratch);
             have_answer = true;
         }
     }
@@ -386,15 +384,6 @@ pub unsafe fn run(
     }
 
     if !have_answer {
-        // The helper is asynchronous. Keep presenting its most recent neural
-        // result while the next request is in flight instead of flashing the
-        // untouched game frame between answers.
-        if last_answer.len() == frame_bytes as usize
-            && ensure(resources, device, instance, physical_device, queue_family, frame_bytes)
-        {
-            let r = resources.as_ref().expect("just ensured above");
-            write_bytes_to_image(device, r, queue, image, width, height, last_answer);
-        }
         return None;
     }
     // A resolution (or format) change between when `inflight` was captured and now
@@ -411,11 +400,10 @@ pub unsafe fn run(
         return None;
     }
 
-    if false && gpu_compose.is_none() {
+    if gpu_compose.is_none() {
         *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
     }
-    if false {
-        let Some(gpu) = gpu_compose else { unreachable!() };
+    if let Some(gpu) = gpu_compose {
         if let Some(sem) = gpu.dispatch_into_image_async(
             device,
             instance,
@@ -464,7 +452,7 @@ pub unsafe fn run(
         settings.colour_strength,
         settings.transfer_strength,
         settings.max_ratio,
-        2,
+        0,
         bgr_order,
     );
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
@@ -712,7 +700,7 @@ unsafe fn run_sync(
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
-    last_answer: &mut Vec<u8>,
+    _last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
     let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
@@ -864,8 +852,6 @@ unsafe fn run_sync(
         // writes past the slice's length, which is exactly `frame_bytes` here.
         let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
         shm.read_answer(answer_dst);
-        last_answer.clear();
-        last_answer.extend_from_slice(answer_dst);
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
         // `dlssnr_protocol::enums::proxy_format` for the format codes).
@@ -886,7 +872,7 @@ unsafe fn run_sync(
                     // full original frame; it therefore collapses most of the model
                     // edit back toward the source image. Present the raw model result
                     // for normal rendering until that proxy pipeline exists.
-                    if false && settings.debug_view == 0 {
+                    if settings.debug_view == 0 {
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
@@ -946,7 +932,7 @@ unsafe fn run_sync(
                             settings.colour_strength,
                             settings.transfer_strength,
                             settings.max_ratio,
-                            if settings.debug_view == 0 { 2 } else { settings.debug_view },
+                            settings.debug_view,
                             bgr_order,
                         );
                     }
@@ -955,19 +941,6 @@ unsafe fn run_sync(
                     // clean frame" -- ShmHeader::apply_model's own doc comment.
                     answer_dst.copy_from_slice(&original);
                 }
-            }
-        }
-    } else if !last_answer.is_empty() && last_answer.len() == frame_bytes as usize {
-        // Keep the presentation mode stable while the asynchronous helper is
-        // processing the next frame. Reusing the last model answer prevents an
-        // untouched original frame from flashing between composited frames.
-        let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
-        answer_dst.copy_from_slice(last_answer);
-        if let Some(settings) = shm.composition_settings() {
-            if settings.apply_model && settings.neural_enabled && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
-                crate::composition::apply::apply_rgba8(&original, answer_dst, settings.colour_strength,
-                    settings.transfer_strength, settings.max_ratio,
-                    if settings.debug_view == 0 { 2 } else { settings.debug_view }, bgr_order);
             }
         }
     }
