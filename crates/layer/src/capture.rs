@@ -286,6 +286,7 @@ pub unsafe fn run(
     original_scratch: &mut Vec<u8>,
     inflight: &mut Inflight,
     answer_scratch: &mut Vec<u8>,
+    last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
     // `composition_settings()` (and everything else below) only ever reads through an
     // already-open mapping -- nothing about it opens one. Every real path that DOES
@@ -325,6 +326,7 @@ pub unsafe fn run(
                 gpu_compose,
                 shm,
                 original_scratch,
+                last_answer,
             )
         };
     }
@@ -698,6 +700,7 @@ unsafe fn run_sync(
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
+    last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
     let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
@@ -849,6 +852,8 @@ unsafe fn run_sync(
         // writes past the slice's length, which is exactly `frame_bytes` here.
         let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
         shm.read_answer(answer_dst);
+        last_answer.clear();
+        last_answer.extend_from_slice(answer_dst);
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
         // `dlssnr_protocol::enums::proxy_format` for the format codes).
@@ -932,6 +937,18 @@ unsafe fn run_sync(
                     // clean frame" -- ShmHeader::apply_model's own doc comment.
                     answer_dst.copy_from_slice(&original);
                 }
+            }
+        }
+    } else if !last_answer.is_empty() && last_answer.len() == frame_bytes as usize {
+        // Keep the presentation mode stable while the asynchronous helper is
+        // processing the next frame. Reusing the last model answer prevents an
+        // untouched original frame from flashing between composited frames.
+        let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
+        answer_dst.copy_from_slice(last_answer);
+        if let Some(settings) = shm.composition_settings() {
+            if settings.apply_model && settings.neural_enabled && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+                crate::composition::apply::apply_rgba8(&original, answer_dst, settings.colour_strength,
+                    settings.transfer_strength, settings.max_ratio, settings.debug_view, bgr_order);
             }
         }
     }
@@ -1194,6 +1211,7 @@ mod tests {
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
+        let mut last_answer = Vec::new();
         let mut inflight = Inflight::default();
 
         let mut got_semaphore = false;
@@ -1226,6 +1244,7 @@ mod tests {
                     &mut original_scratch,
                     &mut inflight,
                     &mut answer_scratch,
+                    &mut last_answer,
                 )
             };
             let call_time = call_start.elapsed();
